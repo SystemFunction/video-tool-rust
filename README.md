@@ -1,0 +1,65 @@
+# Video Tool (Rust / egui)
+
+A native Rust port of the original Flet/Python `video_tool.py`. It downloads
+videos with **yt-dlp** and converts them with **FFmpeg**, wrapped in a native
+[egui](https://github.com/emilk/egui) desktop GUI that compiles to a single,
+self-contained `.exe` — no Python or runtime required.
+
+The app manages its own copies of `yt-dlp`, `ffmpeg`/`ffprobe` and (optionally)
+Deno in `~/.video_tool_v3/` — the **same folder the Python version uses**, so
+binaries installed by either app are shared. yt-dlp downloads are verified
+against the release-signed `SHA2-256SUMS`, and all downloads are HTTPS-only.
+
+## Build
+
+Requires the Rust toolchain (1.75+).
+
+```bash
+cargo build --release
+```
+
+The finished binary lands at `target/release/video_tool.exe`.
+
+Run directly during development:
+
+```bash
+cargo run
+```
+
+## Features ported from the original
+
+- **Download tab** — quality presets (best / AV1 / 4K…480p / audio MP3·WAV·Opus),
+  cookies (browser or `cookies.txt`), existing-file handling (ask / auto-rename /
+  overwrite / skip) with an up-front filename probe, and advanced options:
+  impersonate (anti-bot), SponsorBlock, thumbnail/metadata/chapter embedding,
+  subtitles, and PO-token / bgutil support. Live progress log.
+- **Convert tab** — full codec matrix (H.264/H.265/AV1/VP9, ProRes, DNxHR,
+  Vegas Sync Fix, YouTube/social delivery presets, MP3/WAV audio), hardware
+  encoder selection (NVENC / AMF / QSV / auto-detect), CRF or custom bitrate,
+  HDR-aware color-metadata preservation, and live FFmpeg progress.
+- **Setup tab** — install/update yt-dlp (Stable/Nightly/Master channels),
+  install FFmpeg (via ffbinaries) and Deno, with status readout.
+- **Info tab** — feature overview.
+- Config persisted as JSON in `~/.video_tool_v3/config.json`.
+
+## Intentional differences
+
+- The Python app's **source self-update** (fetching and swapping `video_tool.py`
+  from GitHub) is dropped — it makes no sense for a compiled binary. yt-dlp and
+  FFmpeg can still be updated from the Setup tab.
+
+## Project layout
+
+```
+src/
+  main.rs       entry point + window setup
+  app.rs        egui UI (all four tabs)
+  binaries.rs   yt-dlp/ffmpeg/deno management + SHA-256 verification
+  download.rs   yt-dlp command building + download worker
+  convert.rs    FFmpeg command building + conversion worker
+  config.rs     JSON settings store
+  consts.rs     app constants and option tables
+  emit.rs       worker -> UI message helper
+  types.rs      shared message/state types
+  util.rs       small pure helpers
+```
