@@ -79,5 +79,4 @@ src/
 
 ## License
 
-No license file is included yet; all rights reserved by the author unless a
-license is added later.
+Released under the [MIT License](LICENSE).

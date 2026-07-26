@@ -3,6 +3,7 @@ name = "video_tool"
 version = "0.1.0"
 edition = "2021"
 description = "Desktop app for downloading videos (yt-dlp) and converting them (FFmpeg) - Rust/egui port"
+license = "MIT"
 
 [[bin]]
 name = "video_tool"
