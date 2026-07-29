@@ -14,6 +14,7 @@ use regex::Regex;
 use crate::binaries::{no_window, Binaries};
 use crate::consts::{IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX};
 use crate::emit::Emitter;
+use crate::i18n::{t, tf, Lang};
 use crate::types::{ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg};
 use crate::util;
 
@@ -28,6 +29,16 @@ pub struct DlCtx {
     pub child: ChildSlot,
     pub js_runtime: String,
     pub ytdlp_version: String,
+    pub lang: Lang,
+}
+
+impl DlCtx {
+    fn t(&self, key: &'static str) -> &'static str {
+        t(self.lang, key)
+    }
+    fn tf(&self, key: &'static str, args: &[&str]) -> String {
+        tf(self.lang, key, args)
+    }
 }
 
 /// Builds the yt-dlp command line as (program, args...).
@@ -123,11 +134,16 @@ pub fn build_download_cmd(
         }
     }
 
-    // Base args
-    let default_tmpl = Path::new(out_dir)
-        .join("%(title).200B.%(ext)s")
-        .to_string_lossy()
-        .to_string();
+    // Base args. The directory is a literal path but the template language
+    // treats '%' as a field marker, so a folder like "50% off" would expand
+    // into something unrelated - escape it before appending the pattern.
+    let default_tmpl = {
+        // Escaping only doubles '%', so joining the pattern on afterwards is
+        // still a plain path join.
+        let mut tmpl = PathBuf::from(util::escape_outtmpl(&Path::new(out_dir).to_string_lossy()));
+        tmpl.push("%(title).200B.%(ext)s");
+        tmpl.to_string_lossy().to_string()
+    };
     let mut base: Vec<String> = vec![
         "--newline".into(),
         "--no-playlist".into(),
@@ -237,12 +253,14 @@ pub fn build_download_cmd(
     cmd
 }
 
-fn spawn(bin: &Binaries, args: &[String]) -> std::io::Result<Command> {
+fn spawn(bin: &Binaries, args: &[String]) -> Command {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
     bin.apply_env(&mut cmd);
     no_window(&mut cmd);
-    Ok(cmd)
+    // No console is attached, so yt-dlp must never wait on stdin.
+    cmd.stdin(Stdio::null());
+    cmd
 }
 
 /// Resolves the file yt-dlp *would* write (via --print filename), or None.
@@ -265,31 +283,45 @@ fn probe_target_path(
         cmd[cmd.len() - 1].clone(),
     ]);
 
-    let mut command = spawn(&ctx.bin, &probe).ok()?;
+    let mut command = spawn(&ctx.bin, &probe);
     command.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
-    *ctx.child.lock().unwrap() = Some(child);
+    *util::lock(&ctx.child) = Some(child);
 
-    let reader = BufReader::new(stdout);
+    // Read on a helper thread. Reading inline would block in `lines()` until
+    // yt-dlp produced output, so an extractor that stalls without printing
+    // anything would hang here forever - the deadline below was unreachable.
+    let (line_tx, line_rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let t = line.trim().to_string();
+            if !t.is_empty() && line_tx.send(t).is_err() {
+                return;
+            }
+        }
+    });
+
     let mut lines: Vec<String> = Vec::new();
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
-    for line in reader.lines().map_while(Result::ok) {
-        let t = line.trim().to_string();
-        if !t.is_empty() {
-            lines.push(t);
-        }
-        if ctx.cancel.load(Ordering::SeqCst) || std::time::Instant::now() > deadline {
+    loop {
+        if ctx.cancel.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
             break;
+        }
+        match line_rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) => lines.push(line),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
 
-    let mut guard = ctx.child.lock().unwrap();
-    let status = guard.take().map(|mut c| {
+    // Take the child out of the slot before waiting on it, so the Stop button
+    // on the UI thread never blocks behind a `wait()`.
+    let child = util::lock(&ctx.child).take();
+    let status = child.map(|mut c| {
         let _ = c.kill();
         c.wait()
     });
-    drop(guard);
     let ok = matches!(status, Some(Ok(s)) if s.success());
     if !ok || ctx.cancel.load(Ordering::SeqCst) {
         // yt-dlp exits non-zero on kill; only trust output when it succeeded.
@@ -318,38 +350,23 @@ fn log_preflight_hints(ctx: &DlCtx, url: &str, quality: &str, cookies: &Option<S
     let is_audio = matches!(quality, "audio" | "audio_wav" | "audio_opus");
     if (lo.contains("youtube.com") || lo.contains("youtu.be")) && !is_audio {
         if ctx.js_runtime.is_empty() {
-            ctx.em.log(
-                Task::Download,
-                "Warning: no JS runtime (Deno) found - YouTube often only offers 360p without one. Setup tab -> 'Install Deno'.",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.warn_nojs"));
         } else if !has_cookies && !opts.potoken {
-            ctx.em.log(
-                Task::Download,
-                "Note: without cookies or a PO token, YouTube may withhold some HD formats.",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.note_nocookies"));
         }
     }
     if lo.contains("instagram.com") {
         if util::ytdlp_older_than(&ctx.ytdlp_version, YTDLP_INSTAGRAM_FIX) {
             ctx.em.log(
                 Task::Download,
-                format!(
-                    "Warning: yt-dlp {} is too old for Instagram (empty media response bug, #17074). Setup tab -> 'Update yt-dlp'.",
-                    ctx.ytdlp_version
-                ),
+                ctx.tf("dlw.warn_ig_old", &[&ctx.ytdlp_version]),
             );
         }
         if !has_cookies {
-            ctx.em.log(
-                Task::Download,
-                "Note: Instagram often requires login cookies (cookies.txt is the most reliable).",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.note_ig_cookies"));
         }
         if !opts.impersonate_available {
-            ctx.em.log(
-                Task::Download,
-                "Warning: browser impersonation is unavailable - Instagram usually blocks downloads without it.",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.warn_ig_impersonate"));
         }
     }
 }
@@ -369,7 +386,7 @@ fn resolve_conflict(
         _ => {}
     }
 
-    ctx.em.status(Task::Download, "Checking target file ...");
+    ctx.em.status(Task::Download, ctx.t("dlw.checking_target"));
     let target = probe_target_path(ctx, url, out_dir, quality, cookies, opts);
     if ctx.cancel.load(Ordering::SeqCst) {
         return (None, false, true);
@@ -377,17 +394,14 @@ fn resolve_conflict(
     let target = match target {
         Some(t) => t,
         None => {
-            ctx.em.log(
-                Task::Download,
-                "Note: could not determine the target file name in advance - if a file with the same name exists, yt-dlp will skip the download.",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.no_target_name"));
             return (None, false, false);
         }
     };
     if !target.exists() {
         ctx.em.log(
             Task::Download,
-            format!("Target file: {}", file_name(&target)),
+            ctx.tf("dlw.target_file", &[&file_name(&target)]),
         );
         return (None, false, false);
     }
@@ -396,10 +410,9 @@ fn resolve_conflict(
         let new_path = util::unique_path(&target);
         ctx.em.log(
             Task::Download,
-            format!(
-                "\"{}\" already exists - saving as \"{}\".",
-                file_name(&target),
-                file_name(&new_path)
+            ctx.tf(
+                "dlw.exists_saving_as",
+                &[&file_name(&target), &file_name(&new_path)],
             ),
         );
         return (Some(util::outtmpl_for(&new_path)), false, false);
@@ -408,7 +421,7 @@ fn resolve_conflict(
     // "ask" -> hand the decision to the UI and block until it answers.
     let suggestion = util::unique_path(&target);
     let (reply_tx, reply_rx) = mpsc::channel::<ConflictDecision>();
-    ctx.em.status(Task::Download, "Waiting for your decision ...");
+    ctx.em.status(Task::Download, ctx.t("dlw.waiting_decision"));
     ctx.em.send(UiMsg::Conflict(ConflictReq {
         target: target.clone(),
         suggestion: file_name(&suggestion),
@@ -423,13 +436,13 @@ fn resolve_conflict(
             Ok(ConflictDecision::Overwrite) => {
                 ctx.em.log(
                     Task::Download,
-                    format!("Overwriting the existing \"{}\".", file_name(&target)),
+                    ctx.tf("dlw.overwriting", &[&file_name(&target)]),
                 );
                 return (None, true, false);
             }
             Ok(ConflictDecision::Rename(p)) => {
                 ctx.em
-                    .log(Task::Download, format!("Saving as \"{}\".", file_name(&p)));
+                    .log(Task::Download, ctx.tf("dlw.saving_as", &[&file_name(&p)]));
                 return (Some(util::outtmpl_for(&p)), false, false);
             }
             Ok(ConflictDecision::Skip) => return (None, false, true),
@@ -452,10 +465,10 @@ pub fn run_download(
         run_download_inner(&ctx, &url, &out_dir, &quality, &cookies, &opts);
     }));
     if result.is_err() {
-        ctx.em.log(Task::Download, "Error: internal download worker panic");
-        ctx.em.status(Task::Download, "Download failed");
+        ctx.em.log(Task::Download, ctx.t("dlw.panic"));
+        ctx.em.status(Task::Download, ctx.t("dlw.failed"));
     }
-    *ctx.child.lock().unwrap() = None;
+    *util::lock(&ctx.child) = None;
     ctx.em.busy(Task::Download, false);
 }
 
@@ -475,15 +488,12 @@ fn run_download_inner(
         let stopped = ctx.cancel.load(Ordering::SeqCst);
         ctx.em.progress(Task::Download, -1.0);
         if stopped {
-            ctx.em.status(Task::Download, "Cancelled");
-            ctx.em.log(Task::Download, "\n=== Download cancelled ===");
+            ctx.em.status(Task::Download, ctx.t("status.cancelled"));
+            ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
         } else {
-            ctx.em
-                .status(Task::Download, "Skipped - file already exists");
-            ctx.em
-                .log(Task::Download, "\n=== Skipped - the existing file was kept ===");
-            ctx.em
-                .toast("Skipped - the existing file was kept", true);
+            ctx.em.status(Task::Download, ctx.t("dlw.skipped_status"));
+            ctx.em.log(Task::Download, ctx.t("dlw.skipped_log"));
+            ctx.em.toast(ctx.t("dlw.skipped_toast"), true);
         }
         return;
     }
@@ -498,28 +508,25 @@ fn run_download_inner(
         outtmpl.as_deref(),
         force_overwrite,
     );
-    ctx.em.status(Task::Download, "Downloading ...");
+    ctx.em.status(Task::Download, ctx.t("status.downloading"));
 
-    let mut command = match spawn(&ctx.bin, &cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            ctx.em.log(Task::Download, format!("Error: {e}"));
-            ctx.em.status(Task::Download, "Download failed");
-            return;
-        }
-    };
+    let mut command = spawn(&ctx.bin, &cmd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            ctx.em.log(Task::Download, format!("Error: {e}"));
-            ctx.em.status(Task::Download, "Download failed");
+            ctx.em
+                .log(Task::Download, ctx.tf("common.error", &[&e.to_string()]));
+            ctx.em.status(Task::Download, ctx.t("dlw.failed"));
             return;
         }
     };
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    *ctx.child.lock().unwrap() = Some(child);
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        ctx.em.status(Task::Download, ctx.t("dlw.failed"));
+        return;
+    };
+    *util::lock(&ctx.child) = Some(child);
 
     // Forward stderr to the log on a helper thread.
     let em_err = ctx.em.clone();
@@ -564,7 +571,7 @@ fn run_download_inner(
                         ctx.em.progress(Task::Download, (p / 100.0).clamp(0.0, 1.0));
                         ctx.em.status(
                             Task::Download,
-                            format!("{}%  |  {}  |  ETA {}", &m[1], parts[1], parts[2]),
+                            ctx.tf("dlw.progress_status", &[&m[1], parts[1], parts[2]]),
                         );
                     }
                 }
@@ -573,71 +580,56 @@ fn run_download_inner(
             if let Ok(p) = m[1].parse::<f32>() {
                 ctx.em.progress(Task::Download, (p / 100.0).clamp(0.0, 1.0));
                 ctx.em
-                    .status(Task::Download, format!("Downloading ... {}%", &m[1]));
+                    .status(Task::Download, ctx.tf("dlw.downloading_pct", &[&m[1]]));
             }
         }
     }
     err_handle.join().ok();
 
-    let code = {
-        let mut guard = ctx.child.lock().unwrap();
-        match guard.take() {
-            Some(mut c) => c.wait().ok().and_then(|s| s.code()).unwrap_or(-1),
-            None => -1, // Stop already killed it
-        }
+    // Bound to a local first: a guard used directly as the match scrutinee
+    // would stay alive for the whole match and hold the lock across `wait()`.
+    let child = util::lock(&ctx.child).take();
+    let code = match child {
+        Some(mut c) => c.wait().ok().and_then(|s| s.code()).unwrap_or(-1),
+        None => -1, // Stop already killed it
     };
 
     let cancelled = ctx.cancel.load(Ordering::SeqCst);
     if cancelled {
-        ctx.em.status(Task::Download, "Cancelled");
-        ctx.em.log(Task::Download, "\n=== Download cancelled ===");
+        ctx.em.status(Task::Download, ctx.t("status.cancelled"));
+        ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
     } else if code == 0 && skipped_existing {
         ctx.em.progress(Task::Download, -1.0);
-        ctx.em
-            .status(Task::Download, "Nothing downloaded - file already exists");
-        ctx.em.log(
-            Task::Download,
-            "\n=== Nothing downloaded - a file with this name already exists ===",
-        );
-        ctx.em.log(
-            Task::Download,
-            "Tip: set 'If file exists' to 'Ask me', 'Auto-rename' or 'Overwrite' to download it anyway.",
-        );
-        ctx.em
-            .toast("Nothing downloaded - file already exists", true);
+        ctx.em.status(Task::Download, ctx.t("dlw.nothing_status"));
+        ctx.em.log(Task::Download, ctx.t("dlw.nothing_log"));
+        ctx.em.log(Task::Download, ctx.t("dlw.nothing_tip"));
+        ctx.em.toast(ctx.t("dlw.nothing_status"), true);
     } else if code == 0 {
         ctx.em.progress(Task::Download, 1.0);
-        ctx.em.status(Task::Download, "Download completed");
-        ctx.em.log(Task::Download, "\n=== Download successful ===");
-        ctx.em.toast("Download successful", false);
+        ctx.em.status(Task::Download, ctx.t("dlw.completed"));
+        ctx.em.log(Task::Download, ctx.t("dlw.success_log"));
+        ctx.em.toast(ctx.t("dlw.success_toast"), false);
     } else {
-        ctx.em.status(Task::Download, "Download failed");
-        ctx.em
-            .log(Task::Download, format!("\n=== Download failed (code {code}) ==="));
+        ctx.em.status(Task::Download, ctx.t("dlw.failed"));
+        ctx.em.log(
+            Task::Download,
+            ctx.tf("dlw.failed_log", &[&code.to_string()]),
+        );
         let joined = all_logs.join("\n");
         if joined.contains("empty media response") {
             ctx.em.log(
                 Task::Download,
-                format!(
-                    "Tip: known Instagram \"empty media response\" bug (yt-dlp #17074), fixed in {}. Update yt-dlp in the Setup tab.",
-                    YTDLP_INSTAGRAM_FIX
-                ),
+                ctx.tf("dlw.tip_instagram", &[YTDLP_INSTAGRAM_FIX]),
             );
         } else if joined.contains("requested format is not available")
             || joined.contains("please sign in")
             || joined.contains("login required")
         {
-            ctx.em.log(
-                Task::Download,
-                "Tip: the site withheld formats or wants a login. Set cookies (cookies.txt), install Deno, or update yt-dlp.",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.tip_formats"));
         } else if ctx.js_runtime.is_empty() {
-            ctx.em.log(
-                Task::Download,
-                "Tip: no JS runtime detected. Setup tab -> 'Install Deno' (needed for the YouTube n-challenge).",
-            );
+            ctx.em.log(Task::Download, ctx.t("dlw.tip_nojs"));
         }
-        ctx.em.toast("Download failed", true);
+        ctx.em.toast(ctx.t("dlw.failed"), true);
     }
 }
 

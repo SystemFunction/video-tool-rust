@@ -45,4 +45,8 @@ impl Emitter {
     pub fn setup_log(&self, text: impl Into<String>) {
         self.send(UiMsg::SetupLog(text.into()));
     }
+
+    pub fn setup_busy(&self, busy: bool) {
+        self.send(UiMsg::SetupBusy(busy));
+    }
 }

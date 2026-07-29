@@ -8,7 +8,9 @@ self-contained `.exe` — no Python or runtime required.
 The app manages its own copies of `yt-dlp`, `ffmpeg`/`ffprobe` and (optionally)
 Deno in `~/.video_tool_v3/` — the **same folder the Python version uses**, so
 binaries installed by either app are shared. yt-dlp downloads are verified
-against the release-signed `SHA2-256SUMS`, and all downloads are HTTPS-only.
+against the release-signed `SHA2-256SUMS` and discarded if the checksum cannot
+be fetched or does not match; all downloads are HTTPS-only, including after
+redirects.
 
 ## Download
 
@@ -19,11 +21,14 @@ page and run `video_tool.exe` — no installation needed. On first launch, open 
 
 ## Features
 
+- **Languages** — English (default), German and French, switchable at any time
+  from the picker in the header. The choice is remembered in the config.
 - **Download tab** — quality presets (best / AV1 / 4K…480p / audio MP3·WAV·Opus),
   cookies (browser or `cookies.txt`), existing-file handling (ask / auto-rename /
-  overwrite / skip) with an up-front filename probe, and advanced options:
-  impersonate (anti-bot), SponsorBlock, thumbnail/metadata/chapter embedding,
-  subtitles, and PO-token / bgutil support. Live progress log.
+  overwrite / skip) with an up-front filename probe, a folder picker for the save
+  location, and advanced options: impersonate (anti-bot), SponsorBlock,
+  thumbnail/metadata/chapter embedding, subtitles, and PO-token / bgutil support.
+  Live progress log.
 - **Convert tab** — full codec matrix (H.264/H.265/AV1/VP9, ProRes, DNxHR,
   Vegas Sync Fix, YouTube/social delivery presets, MP3/WAV audio), hardware
   encoder selection (NVENC / AMF / QSV / auto-detect), CRF or custom bitrate,
@@ -72,6 +77,7 @@ src/
   convert.rs    FFmpeg command building + conversion worker
   config.rs     JSON settings store
   consts.rs     app constants and option tables
+  i18n.rs       English/German/French translation table
   emit.rs       worker -> UI message helper
   types.rs      shared message/state types
   util.rs       small pure helpers

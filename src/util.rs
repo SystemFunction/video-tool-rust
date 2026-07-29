@@ -1,9 +1,21 @@
 //! Small pure helpers ported from the Python original.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
+
+/// Locks without propagating poisoning.
+///
+/// A worker that panics while holding the child-process slot would otherwise
+/// poison it, and every later `unwrap()` - including the one behind the Stop
+/// button on the UI thread - would panic and take the whole app down. The
+/// data behind these locks is a plain `Option<Child>`, so there is no
+/// invariant a panic could have left half-updated.
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Parses an "H:M:S(.frac)" timestamp into seconds.
 pub fn parse_hms_to_seconds(value: &str) -> Option<f64> {
@@ -61,9 +73,20 @@ pub fn parse_speed_value(speed_text: &str) -> Option<f64> {
 
 const ILLEGAL_FS_CHARS: &str = "<>:\"/\\|?*";
 
+/// Names Windows refuses to use for a file, with or without an extension.
+const RESERVED_STEMS: &[&str] = &[
+    "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
+    "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
 /// Makes a user-typed name safe for the filesystem.
+///
+/// Strips path separators and control characters, so the result can only ever
+/// name a file inside the directory it is joined onto - never a sibling or a
+/// parent. Truncation happens before the final trim so a cut cannot leave a
+/// trailing dot or space behind, which Windows silently drops.
 pub fn sanitize_filename(name: &str) -> String {
-    let mut cleaned: String = name
+    let cleaned: String = name
         .chars()
         .map(|ch| {
             if ILLEGAL_FS_CHARS.contains(ch) || (ch as u32) < 32 {
@@ -72,9 +95,16 @@ pub fn sanitize_filename(name: &str) -> String {
                 ch
             }
         })
+        .take(200)
         .collect();
-    cleaned = cleaned.trim().trim_end_matches(['.', ' ']).to_string();
-    cleaned.chars().take(200).collect()
+    let cleaned = cleaned.trim().trim_end_matches(['.', ' ']).trim().to_string();
+
+    // "CON" and "CON.mp4" both resolve to the console device on Windows.
+    let stem = cleaned.split('.').next().unwrap_or("").to_lowercase();
+    if RESERVED_STEMS.contains(&stem.as_str()) {
+        return format!("_{cleaned}");
+    }
+    cleaned
 }
 
 /// Returns `path` if free, otherwise the first free "name (N).ext" variant.
@@ -178,5 +208,60 @@ pub fn convert_audio_ext(codec_key: &str) -> Option<&'static str> {
         "audio_mp3" => Some("mp3"),
         "audio_wav" => Some("wav"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_strips_path_separators() {
+        // The result is joined onto a directory, so it must not be able to
+        // walk out of it.
+        assert_eq!(sanitize_filename("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_filename(r"a\b/c"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_drops_a_bare_traversal() {
+        assert_eq!(sanitize_filename(".."), "");
+        assert_eq!(sanitize_filename("."), "");
+    }
+
+    #[test]
+    fn sanitize_replaces_control_characters() {
+        assert_eq!(sanitize_filename("a\u{0}b\nc"), "a_b_c");
+    }
+
+    #[test]
+    fn sanitize_never_ends_in_a_dot_or_space_after_truncation() {
+        let name = format!("{}. more", "x".repeat(199));
+        let out = sanitize_filename(&name);
+        assert!(out.len() <= 200);
+        assert!(!out.ends_with('.') && !out.ends_with(' '), "got {out:?}");
+    }
+
+    #[test]
+    fn sanitize_escapes_windows_device_names() {
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("nul.mp4"), "_nul.mp4");
+        // Only exact device stems are affected.
+        assert_eq!(sanitize_filename("console.mp4"), "console.mp4");
+    }
+
+    #[test]
+    fn outtmpl_escapes_percent_in_the_directory() {
+        // '%' starts a field in yt-dlp's template language.
+        assert_eq!(escape_outtmpl("C:/50% off/x"), "C:/50%% off/x");
+    }
+
+    #[test]
+    fn ytdlp_version_comparison() {
+        assert!(ytdlp_older_than("2026.06.01", "2026.07.04"));
+        assert!(!ytdlp_older_than("2026.07.04", "2026.07.04"));
+        assert!(!ytdlp_older_than("2026.08.01", "2026.07.04"));
+        // Unparseable versions must not trigger a false warning.
+        assert!(!ytdlp_older_than("unknown", "2026.07.04"));
     }
 }

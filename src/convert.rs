@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::binaries::{no_window, Binaries};
 use crate::emit::Emitter;
+use crate::i18n::{t, tf, Lang};
 use crate::types::Task;
 use crate::util;
 
@@ -21,6 +22,16 @@ pub struct CvCtx {
     pub em: Emitter,
     pub cancel: Arc<AtomicBool>,
     pub child: ChildSlot,
+    pub lang: Lang,
+}
+
+impl CvCtx {
+    fn t(&self, key: &'static str) -> &'static str {
+        t(self.lang, key)
+    }
+    fn tf(&self, key: &'static str, args: &[&str]) -> String {
+        tf(self.lang, key, args)
+    }
 }
 
 #[derive(Clone)]
@@ -285,11 +296,10 @@ pub fn build_ffmpeg_cmd(
 ) -> Vec<String> {
     if profile.audio_only {
         let mut cmd = v(&[
-            ffmpeg, "-hide_banner", "-y", "-progress", "pipe:1", "-stats_period",
-            "0.5", "-nostats", "-i", input_file, "-vn", "-map", "0:a:0",
+            ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1",
+            "-stats_period", "0.5", "-nostats", "-i", input_file, "-vn", "-map", "0:a:0",
             "-map_metadata", "0", "-c:a",
         ]);
-        cmd[0] = ffmpeg.to_string();
         cmd.push(profile.audio_codec.clone());
         if let Some(br) = &profile.audio_bitrate {
             cmd.push("-b:a".into());
@@ -300,8 +310,9 @@ pub fn build_ffmpeg_cmd(
     }
 
     let mut cmd: Vec<String> = vec![
-        ffmpeg.to_string(), "-hide_banner".into(), "-y".into(), "-progress".into(),
-        "pipe:1".into(), "-stats_period".into(), "0.5".into(), "-nostats".into(),
+        ffmpeg.to_string(), "-hide_banner".into(), "-nostdin".into(), "-y".into(),
+        "-progress".into(), "pipe:1".into(), "-stats_period".into(), "0.5".into(),
+        "-nostats".into(),
         "-fflags".into(), "+genpts".into(), "-i".into(), input_file.to_string(),
         "-map".into(), "0:v:0".into(), "-map".into(), "0:a?".into(),
         "-map_metadata".into(), "0".into(), "-map_chapters".into(), "0".into(),
@@ -432,68 +443,95 @@ fn probe_color_meta(bin: &Binaries, file: &str) -> BTreeMap<String, String> {
 }
 
 /// The conversion worker (runs on its own thread).
+///
+/// The panic guard mirrors the download worker: without it a panic here would
+/// leave the UI permanently "busy", with Convert greyed out until restart.
 pub fn run_conversion(ctx: CvCtx, input_file: String, output_file: String, params: ConvertParams) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_conversion_inner(&ctx, &input_file, &output_file, &params);
+    }));
+    if result.is_err() {
+        ctx.em.log(Task::Convert, ctx.t("cvw.panic"));
+        ctx.em.status(Task::Convert, ctx.t("cvw.failed"));
+    }
+    *util::lock(&ctx.child) = None;
+    ctx.em.busy(Task::Convert, false);
+}
+
+fn run_conversion_inner(
+    ctx: &CvCtx,
+    input_file: &str,
+    output_file: &str,
+    params: &ConvertParams,
+) {
     let ffmpeg = ctx.bin.ffmpeg_path();
-    let source_pix = probe_pix_fmt(&ctx.bin, &input_file);
+    let source_pix = probe_pix_fmt(&ctx.bin, input_file);
     let color_meta = if params.preserve_color {
-        probe_color_meta(&ctx.bin, &input_file)
+        probe_color_meta(&ctx.bin, input_file)
     } else {
         BTreeMap::new()
     };
-    let profile = build_convert_args(&ctx.bin, &params, source_pix.as_deref());
-    let duration = probe_duration(&ctx.bin, &input_file);
+    let profile = build_convert_args(&ctx.bin, params, source_pix.as_deref());
+    let duration = probe_duration(&ctx.bin, input_file);
 
-    let cmd = build_ffmpeg_cmd(&ffmpeg, &input_file, &output_file, &profile, &color_meta, params.preserve_color);
+    let cmd = build_ffmpeg_cmd(&ffmpeg, input_file, output_file, &profile, &color_meta, params.preserve_color);
 
     if profile.audio_only {
         ctx.em.log(
             Task::Convert,
-            format!("Codec:  {} -> {} (audio only)", profile.codec_key, profile.audio_codec),
+            ctx.tf("cvw.codec_audio", &[&profile.codec_key, &profile.audio_codec]),
         );
     } else {
         ctx.em.log(
             Task::Convert,
-            format!("Codec:  {} -> {}", profile.codec_key, profile.video_codec),
+            ctx.tf("cvw.codec", &[&profile.codec_key, &profile.video_codec]),
         );
         if profile.hw_requested == "auto" {
             ctx.em
-                .log(Task::Convert, format!("HW:     auto -> {}", profile.hw_resolved));
+                .log(Task::Convert, ctx.tf("cvw.hw_auto", &[&profile.hw_resolved]));
         }
         let mode = if profile.use_custom {
-            format!("Custom {}M", profile.custom_br)
+            ctx.tf("cvw.mode_custom", &[&profile.custom_br.to_string()])
         } else {
-            format!("CRF {}", profile.crf)
+            ctx.tf("cvw.mode_crf", &[&profile.crf.to_string()])
         };
-        ctx.em.log(Task::Convert, format!("Mode:   {mode}"));
+        ctx.em.log(Task::Convert, ctx.tf("cvw.mode", &[&mode]));
     }
     if let Some(p) = &source_pix {
-        ctx.em.log(Task::Convert, format!("Source: pix_fmt={p}"));
+        ctx.em.log(Task::Convert, ctx.tf("cvw.source", &[p]));
     }
     if !color_meta.is_empty() {
         let s: Vec<String> = color_meta.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        ctx.em.log(Task::Convert, format!("Color:  {}", s.join(", ")));
+        ctx.em.log(Task::Convert, ctx.tf("cvw.color", &[&s.join(", ")]));
     }
     if let Some(d) = duration {
-        ctx.em.log(Task::Convert, format!("Duration: {d:.1}s"));
+        ctx.em
+            .log(Task::Convert, ctx.tf("cvw.duration", &[&format!("{d:.1}")]));
     }
     ctx.em.log(Task::Convert, "-".repeat(44));
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
     no_window(&mut command);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
-            ctx.em.log(Task::Convert, format!("Error: {e}"));
-            ctx.em.status(Task::Convert, "Conversion failed");
-            ctx.em.busy(Task::Convert, false);
+            ctx.em
+                .log(Task::Convert, ctx.tf("common.error", &[&e.to_string()]));
+            ctx.em.status(Task::Convert, ctx.t("cvw.failed"));
             return;
         }
     };
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    *ctx.child.lock().unwrap() = Some(child);
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        let _ = child.kill();
+        ctx.em.status(Task::Convert, ctx.t("cvw.failed"));
+        return;
+    };
+    *util::lock(&ctx.child) = Some(child);
 
     // ffmpeg logs to stderr; keep the last lines for error reporting.
     let em_err = ctx.em.clone();
@@ -557,20 +595,16 @@ pub fn run_conversion(ctx: CvCtx, input_file: String, output_file: String, param
                     ctx.em.progress(Task::Convert, pct);
                     ctx.em.status(
                         Task::Convert,
-                        format!(
-                            "Converting ... {:.1}%  |  {}  |  {}  |  {} fps  |  ETA {}",
-                            pct * 100.0,
-                            bitrate,
-                            speed,
-                            fps,
-                            eta
+                        ctx.tf(
+                            "cvw.converting_pct",
+                            &[&format!("{:.1}", pct * 100.0), &bitrate, &speed, &fps, &eta],
                         ),
                     );
                 }
                 _ => {
                     ctx.em.status(
                         Task::Convert,
-                        format!("Converting ...  |  {}  |  {}  |  {} fps", bitrate, speed, fps),
+                        ctx.tf("cvw.converting_plain", &[&bitrate, &speed, &fps]),
                     );
                 }
             }
@@ -581,29 +615,27 @@ pub fn run_conversion(ctx: CvCtx, input_file: String, output_file: String, param
     }
     err_handle.join().ok();
 
-    let code = {
-        let mut guard = ctx.child.lock().unwrap();
-        match guard.take() {
-            Some(mut c) => c.wait().ok().and_then(|s| s.code()).unwrap_or(-1),
-            None => -1,
-        }
+    // Bound to a local so the guard is dropped before the blocking `wait()`.
+    let child = util::lock(&ctx.child).take();
+    let code = match child {
+        Some(mut c) => c.wait().ok().and_then(|s| s.code()).unwrap_or(-1),
+        None => -1,
     };
 
     if ctx.cancel.load(Ordering::SeqCst) {
-        ctx.em.status(Task::Convert, "Cancelled");
-        ctx.em.log(Task::Convert, "\n=== Conversion cancelled ===");
+        ctx.em.status(Task::Convert, ctx.t("status.cancelled"));
+        ctx.em.log(Task::Convert, ctx.t("cvw.cancelled_log"));
     } else if code == 0 {
         ctx.em.progress(Task::Convert, 1.0);
-        ctx.em.status(Task::Convert, "Conversion completed");
-        ctx.em.log(Task::Convert, "\n=== Conversion successful ===");
-        ctx.em.toast("Conversion successful", false);
+        ctx.em.status(Task::Convert, ctx.t("cvw.completed"));
+        ctx.em.log(Task::Convert, ctx.t("cvw.success_log"));
+        ctx.em.toast(ctx.t("cvw.success_toast"), false);
     } else {
-        ctx.em.status(Task::Convert, "Conversion failed");
+        ctx.em.status(Task::Convert, ctx.t("cvw.failed"));
         ctx.em
-            .log(Task::Convert, format!("\n=== Conversion failed (code {code}) ==="));
-        ctx.em.toast("Conversion failed", true);
+            .log(Task::Convert, ctx.tf("cvw.failed_log", &[&code.to_string()]));
+        ctx.em.toast(ctx.t("cvw.failed"), true);
     }
-    ctx.em.busy(Task::Convert, false);
 }
 
 fn parse_out_time(progress: &BTreeMap<String, String>) -> Option<f64> {

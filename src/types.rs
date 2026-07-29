@@ -18,6 +18,8 @@ pub enum UiMsg {
     Busy(Task, bool),
     Toast(String, bool),
     SetupLog(String),
+    /// Guards the Setup tab while an install/update thread is running.
+    SetupBusy(bool),
     Binary(BinaryStatus),
     Conflict(ConflictReq),
 }

@@ -6,7 +6,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
@@ -83,6 +83,9 @@ impl Binaries {
         let mut cmd = Command::new(program);
         self.apply_env(&mut cmd);
         no_window(&mut cmd);
+        // A GUI app has no console to read from; leaving stdin inherited lets
+        // a child block forever waiting on input that can never arrive.
+        cmd.stdin(Stdio::null());
         cmd
     }
 
@@ -239,6 +242,16 @@ impl Binaries {
             .timeout(Duration::from_secs(180))
             .call()
             .map_err(|e| format!("request failed: {e}"))?;
+        // Redirects are followed automatically, so the URL we vetted above is
+        // not necessarily the one that served the bytes. Re-check the final
+        // hop; otherwise a redirect to http:// would silently downgrade the
+        // transport for an executable we are about to run.
+        if !resp.get_url().to_lowercase().starts_with("https://") {
+            return Err(format!(
+                "Refusing redirect to a non-HTTPS URL: {}",
+                resp.get_url()
+            ));
+        }
         let total: u64 = resp
             .header("Content-Length")
             .and_then(|s| s.parse().ok())
@@ -290,40 +303,47 @@ impl Binaries {
     }
 
     /// Verifies a freshly downloaded yt-dlp binary against SHA2-256SUMS.
-    /// Best-effort: unreachable list or missing entry -> proceed.
+    ///
+    /// Fails closed. This binary is executed with the user's privileges on
+    /// every download, so "could not verify" has to be treated exactly like
+    /// "did not match": anything able to disrupt the checksum request would
+    /// otherwise be enough to get an unverified executable installed.
     fn verify_ytdlp_checksum(&self, target: &PathBuf, asset_name: &str) -> Result<(), String> {
-        let sums_url =
-            "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
-        let sums_text = match ureq::get(sums_url)
+        let discard = |msg: String| -> String {
+            let _ = fs::remove_file(target);
+            msg
+        };
+
+        let sums_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
+        let sums_text = ureq::get(sums_url)
             .timeout(Duration::from_secs(30))
             .call()
-        {
-            Ok(r) => match r.into_string() {
-                Ok(t) => t,
-                Err(_) => return Ok(()),
-            },
-            Err(_) => return Ok(()),
-        };
-        let mut expected: Option<String> = None;
-        for line in sums_text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() == 2 && parts[1].trim_start_matches('*') == asset_name {
-                expected = Some(parts[0].trim().to_lowercase());
-                break;
-            }
-        }
-        let expected = match expected {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-        let actual = Self::sha256_file(target)?;
+            .map_err(|e| discard(format!("could not fetch SHA2-256SUMS ({e}) - yt-dlp download discarded, please retry")))?
+            .into_string()
+            .map_err(|e| discard(format!("could not read SHA2-256SUMS ({e}) - yt-dlp download discarded, please retry")))?;
+
+        let expected = sums_text
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let hash = parts.next()?;
+                let name = parts.next()?.trim_start_matches('*');
+                (name == asset_name && parts.next().is_none()).then(|| hash.to_lowercase())
+            })
+            .find(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                discard(format!(
+                    "no valid SHA2-256SUMS entry for '{asset_name}' - yt-dlp download discarded"
+                ))
+            })?;
+
+        let actual = Self::sha256_file(target).map_err(discard)?;
         if actual != expected {
-            let _ = fs::remove_file(target);
-            return Err(format!(
+            return Err(discard(format!(
                 "yt-dlp checksum mismatch - download discarded (expected {}..., got {}...).",
-                &expected[..expected.len().min(12)],
-                &actual[..actual.len().min(12)]
-            ));
+                short_hash(&expected),
+                short_hash(&actual)
+            )));
         }
         Ok(())
     }
@@ -441,7 +461,15 @@ impl Binaries {
     }
 }
 
+/// Truncates a hex digest for display without ever splitting a character.
+fn short_hash(hash: &str) -> String {
+    hash.chars().take(12).collect()
+}
+
 /// Extracts the member named `name`(.exe) from a zip into `target`.
+///
+/// Only the member's base name is ever considered and the destination is a
+/// fixed path, so a crafted archive cannot steer the write elsewhere.
 fn extract_named(zip_path: &PathBuf, target: &PathBuf, name: &str) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
@@ -454,8 +482,8 @@ fn extract_named(zip_path: &PathBuf, target: &PathBuf, name: &str) -> Result<(),
         let base = member
             .name()
             .to_lowercase()
-            .trim_end_matches('/')
-            .rsplit('/')
+            .trim_end_matches(['/', '\\'])
+            .rsplit(['/', '\\'])
             .next()
             .unwrap_or("")
             .to_string();

@@ -8,6 +8,7 @@ mod consts;
 mod convert;
 mod download;
 mod emit;
+mod i18n;
 mod types;
 mod util;
 
