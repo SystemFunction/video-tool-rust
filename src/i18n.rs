@@ -433,6 +433,49 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Binaires yt-dlp vérifiés via les SHA2-256SUMS signés",
         ),
 
+        // ---------------- updates ----------------
+        "update.title" => ("Update available", "Update verfügbar", "Mise à jour disponible"),
+        "update.body" => (
+            "Version {} is available - you are running {}.",
+            "Version {} ist verfügbar - du nutzt {}.",
+            "La version {} est disponible - vous utilisez la {}.",
+        ),
+        "update.notes" => ("What's new", "Neuerungen", "Nouveautés"),
+        "update.install" => ("Download & install", "Herunterladen & installieren", "Télécharger et installer"),
+        "update.open_page" => ("Open release page", "Release-Seite öffnen", "Ouvrir la page de version"),
+        "update.later" => ("Later", "Später", "Plus tard"),
+        "update.skip" => ("Skip this version", "Diese Version überspringen", "Ignorer cette version"),
+        "update.downloading" => ("Downloading update", "Lade Update herunter", "Téléchargement de la mise à jour"),
+        "update.installed" => (
+            "Update installed - restart to use version {}.",
+            "Update installiert - zum Verwenden von Version {} neu starten.",
+            "Mise à jour installée - redémarrez pour utiliser la version {}.",
+        ),
+        "update.restart" => ("Restart now", "Jetzt neu starten", "Redémarrer maintenant"),
+        "update.failed" => ("Update failed: {}", "Update fehlgeschlagen: {}", "Échec de la mise à jour : {}"),
+        "update.no_asset" => (
+            "This release has no verifiable download for your platform - please update manually from the release page.",
+            "Dieses Release enthält keinen überprüfbaren Download für deine Plattform - bitte manuell über die Release-Seite aktualisieren.",
+            "Cette version ne propose pas de téléchargement vérifiable pour votre plateforme - veuillez mettre à jour manuellement depuis la page de version.",
+        ),
+        "update.check_now" => ("⟳ Check for updates", "⟳ Nach Updates suchen", "⟳ Rechercher des mises à jour"),
+        "update.checking" => ("Checking for updates ...", "Suche nach Updates ...", "Recherche de mises à jour ..."),
+        "update.up_to_date" => (
+            "You are running the latest version ({}).",
+            "Du nutzt die neueste Version ({}).",
+            "Vous utilisez la dernière version ({}).",
+        ),
+        "update.check_failed" => (
+            "Update check failed: {}",
+            "Update-Suche fehlgeschlagen: {}",
+            "Échec de la recherche de mises à jour : {}",
+        ),
+        "update.auto_check" => (
+            "Check for updates on start",
+            "Beim Start nach Updates suchen",
+            "Rechercher des mises à jour au démarrage",
+        ),
+
         // ---------------- conflict modal ----------------
         "conflict.title" => ("File already exists", "Datei existiert bereits", "Le fichier existe déjà"),
         "conflict.body" => (

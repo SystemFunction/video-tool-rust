@@ -22,6 +22,19 @@ pub enum UiMsg {
     SetupBusy(bool),
     Binary(BinaryStatus),
     Conflict(ConflictReq),
+    /// Outcome of an update check: Ok(Some) = newer release, Ok(None) = current.
+    UpdateCheck(Result<Option<crate::update::Release>, String>, CheckKind),
+    /// Progress line shown while an update downloads.
+    UpdateStatus(String),
+    /// Outcome of installing an update; Ok carries the new version string.
+    UpdateInstalled(Result<String, String>),
+}
+
+/// Whether an update check was triggered by the user or ran on start.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CheckKind {
+    Automatic,
+    Manual,
 }
 
 #[derive(Clone, Default)]

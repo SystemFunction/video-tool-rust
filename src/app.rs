@@ -17,7 +17,10 @@ use crate::convert::{self, ConvertParams, CvCtx};
 use crate::download::{self, DlCtx};
 use crate::emit::Emitter;
 use crate::i18n::{self, Lang};
-use crate::types::{BinaryStatus, ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg};
+use crate::types::{
+    BinaryStatus, CheckKind, ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg,
+};
+use crate::update::{self, Release};
 use crate::util;
 
 const MAX_LOG: usize = 1200;
@@ -86,6 +89,26 @@ pub struct App {
     pending_conflict: Option<ConflictReq>,
     conflict_name: String,
     conflict_error: Option<String>,
+
+    // updates
+    update_auto: bool,
+    update_ui: UpdateUi,
+    update_checking: bool,
+    /// Progress/result line for the Setup tab and the modal.
+    update_status: String,
+}
+
+/// What the update modal is currently showing. An install has to stay on
+/// screen from the click through to the restart prompt - closing the dialog
+/// the moment work starts leaves the user with no sign anything happened.
+enum UpdateUi {
+    Idle,
+    Offer(Release),
+    Installing(Release),
+    /// Swap succeeded; carries the version now on disk.
+    Installed(String),
+    /// Install failed; the message lives in `update_status`.
+    Failed(Release),
 }
 
 impl App {
@@ -161,6 +184,11 @@ impl App {
             conflict_name: String::new(),
             conflict_error: None,
 
+            update_auto: config.get_bool("update_check", true),
+            update_ui: UpdateUi::Idle,
+            update_checking: false,
+            update_status: String::new(),
+
             status: BinaryStatus::default(),
             config,
             tx,
@@ -171,8 +199,14 @@ impl App {
         // Prefill the URL: a clipboard URL wins, otherwise the last used one.
         app.dl_url = clipboard_url().unwrap_or_else(|| app.config.get_str("last_url", ""));
 
+        // Drop the binary a previous update moved aside.
+        update::cleanup_backup();
+
         // Kick off the background binary probe.
         app.start_probe();
+        if app.update_auto {
+            app.start_update_check(CheckKind::Automatic);
+        }
         app
     }
 
@@ -212,6 +246,39 @@ impl App {
         let em = self.emitter();
         thread::spawn(move || {
             em.send(UiMsg::Binary(bin.probe_status()));
+        });
+    }
+
+    fn start_update_check(&mut self, kind: CheckKind) {
+        if self.update_checking || matches!(self.update_ui, UpdateUi::Installing(_)) {
+            return;
+        }
+        self.update_checking = true;
+        if kind == CheckKind::Manual {
+            self.update_status = self.t("update.checking").to_string();
+        }
+        let em = self.emitter();
+        thread::spawn(move || {
+            em.send(UiMsg::UpdateCheck(update::check_latest(), kind));
+        });
+    }
+
+    fn start_update_install(&mut self, release: Release) {
+        let Some(asset) = release.asset.clone() else {
+            return;
+        };
+        let version = release.version.clone();
+        self.update_status = self.t("update.downloading").to_string();
+        self.update_ui = UpdateUi::Installing(release);
+        let em = self.emitter();
+        let lang = self.lang;
+        thread::spawn(move || {
+            let prefix = i18n::t(lang, "update.downloading");
+            let result = update::install(&asset, |w, t| {
+                em.update_status(progress_text(lang, prefix, w, t));
+            })
+            .map(|_| version);
+            em.send(UiMsg::UpdateInstalled(result));
         });
     }
 
@@ -264,6 +331,51 @@ impl App {
                     self.conflict_error = None;
                     self.pending_conflict = Some(req);
                 }
+                UiMsg::UpdateStatus(s) => self.update_status = s,
+                UiMsg::UpdateCheck(result, kind) => {
+                    self.update_checking = false;
+                    match result {
+                        Ok(Some(release)) => {
+                            // A version the user chose to skip stays silent on
+                            // start, but a manual check always reports it.
+                            let skipped =
+                                self.config.get_str("update_skip_version", "") == release.version;
+                            if kind == CheckKind::Manual || !skipped {
+                                self.update_status.clear();
+                                self.update_ui = UpdateUi::Offer(release);
+                            }
+                        }
+                        Ok(None) => {
+                            if kind == CheckKind::Manual {
+                                self.update_status = self.tf("update.up_to_date", &[VERSION]);
+                            }
+                        }
+                        Err(e) => {
+                            // A failed automatic check stays quiet - being
+                            // offline is not something to interrupt over.
+                            if kind == CheckKind::Manual {
+                                self.update_status = self.tf("update.check_failed", &[&e]);
+                            }
+                        }
+                    }
+                }
+                UiMsg::UpdateInstalled(result) => match result {
+                    Ok(version) => {
+                        self.update_status = self.tf("update.installed", &[&version]);
+                        self.update_ui = UpdateUi::Installed(version);
+                    }
+                    Err(e) => {
+                        self.update_status = self.tf("update.failed", &[&e]);
+                        let release = match std::mem::replace(&mut self.update_ui, UpdateUi::Idle) {
+                            UpdateUi::Installing(r) => r,
+                            other => {
+                                self.update_ui = other;
+                                continue;
+                            }
+                        };
+                        self.update_ui = UpdateUi::Failed(release);
+                    }
+                },
             }
         }
     }
@@ -1148,6 +1260,49 @@ impl App {
         if !self.setup_log.is_empty() {
             ui.label(&self.setup_log);
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.label(RichText::new(format!("{APP_NAME} v{VERSION}")).strong());
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let idle = !self.update_checking
+                    && !matches!(self.update_ui, UpdateUi::Installing(_));
+                if ui
+                    .add_enabled(idle, egui::Button::new(self.t("update.check_now")))
+                    .clicked()
+                {
+                    self.start_update_check(CheckKind::Manual);
+                }
+                let l_auto = self.t("update.auto_check");
+                if ui.checkbox(&mut self.update_auto, l_auto).changed() {
+                    self.config.set_bool("update_check", self.update_auto);
+                }
+                // Only meaningful once a swap has actually happened.
+                if matches!(self.update_ui, UpdateUi::Installed(_))
+                    && ui.button(self.t("update.restart")).clicked()
+                {
+                    self.restart_for_update();
+                }
+            });
+            if !self.update_status.is_empty() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(&self.update_status).size(11.0).color(Color32::GRAY));
+            }
+        });
+    }
+
+    fn restart_for_update(&mut self) {
+        self.config.flush(true);
+        match update::restart() {
+            Ok(_) => self.ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                let msg = self.tf("update.failed", &[&e]);
+                self.toast(&msg, true);
+            }
+        }
     }
 
     fn ui_info(&mut self, ui: &mut egui::Ui) {
@@ -1255,6 +1410,138 @@ impl App {
         }
     }
 
+    fn show_update_modal(&mut self, ctx: &egui::Context) {
+        if matches!(self.update_ui, UpdateUi::Idle) {
+            return;
+        }
+        // Snapshot what the modal needs so the closure does not borrow self.
+        let (title_version, notes, page_url, has_asset) = match &self.update_ui {
+            UpdateUi::Offer(r) | UpdateUi::Installing(r) | UpdateUi::Failed(r) => (
+                r.version.clone(),
+                r.notes.clone(),
+                r.page_url.clone(),
+                r.asset.is_some(),
+            ),
+            UpdateUi::Installed(v) => (v.clone(), String::new(), String::new(), true),
+            UpdateUi::Idle => unreachable!(),
+        };
+        let installing = matches!(self.update_ui, UpdateUi::Installing(_));
+        let installed = matches!(self.update_ui, UpdateUi::Installed(_));
+        let failed = matches!(self.update_ui, UpdateUi::Failed(..));
+        let offering = matches!(self.update_ui, UpdateUi::Offer(_));
+
+        let body = if installed {
+            self.tf("update.installed", &[&title_version])
+        } else {
+            self.tf("update.body", &[&title_version, VERSION])
+        };
+        let status = self.update_status.clone();
+
+        let mut install = false;
+        let mut restart = false;
+        let mut open_page = false;
+        let mut close = false;
+        let mut skip = false;
+
+        egui::Window::new(self.t("update.title"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(520.0);
+                ui.label(RichText::new(body).strong());
+
+                if offering && !notes.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(self.t("update.notes"))
+                            .size(12.0)
+                            .color(Color32::GRAY),
+                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt("update_notes")
+                        .max_height(180.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new(&notes).size(12.0));
+                        });
+                }
+                if offering && !has_asset {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(self.t("update.no_asset"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 183, 77)),
+                    );
+                }
+                if (installing || failed) && !status.is_empty() {
+                    ui.add_space(6.0);
+                    let color = if failed {
+                        Color32::from_rgb(239, 154, 154)
+                    } else {
+                        Color32::GRAY
+                    };
+                    ui.label(RichText::new(&status).size(12.0).color(color));
+                }
+                if installing {
+                    ui.add_space(4.0);
+                    ui.add(egui::ProgressBar::new(0.0).desired_height(4.0).animate(true));
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if offering {
+                        if ui
+                            .add_enabled(has_asset, egui::Button::new(self.t("update.install")))
+                            .clicked()
+                        {
+                            install = true;
+                        }
+                        if ui.button(self.t("update.open_page")).clicked() {
+                            open_page = true;
+                        }
+                        if ui.button(self.t("update.later")).clicked() {
+                            close = true;
+                        }
+                        if ui.button(self.t("update.skip")).clicked() {
+                            skip = true;
+                        }
+                    } else if installed {
+                        if ui.button(self.t("update.restart")).clicked() {
+                            restart = true;
+                        }
+                        if ui.button(self.t("update.later")).clicked() {
+                            close = true;
+                        }
+                    } else if failed {
+                        if ui.button(self.t("update.open_page")).clicked() {
+                            open_page = true;
+                        }
+                        if ui.button(self.t("update.later")).clicked() {
+                            close = true;
+                        }
+                    }
+                });
+            });
+
+        if open_page {
+            open_url(&page_url);
+            close = true;
+        }
+        if skip {
+            self.config.set_str("update_skip_version", &title_version);
+            close = true;
+        }
+        if install {
+            if let UpdateUi::Offer(r) = std::mem::replace(&mut self.update_ui, UpdateUi::Idle) {
+                self.start_update_install(r);
+            }
+        } else if restart {
+            self.restart_for_update();
+        } else if close {
+            self.update_ui = UpdateUi::Idle;
+        }
+    }
+
     fn show_toasts(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         self.toasts.retain(|t| t.until > now);
@@ -1317,6 +1604,7 @@ impl eframe::App for App {
         });
 
         self.show_conflict_modal(ctx);
+        self.show_update_modal(ctx);
         self.show_toasts(ctx);
 
         // Coalesced write of anything the frame changed.
@@ -1501,6 +1789,28 @@ fn clipboard_url() -> Option<String> {
         Some(t)
     } else {
         None
+    }
+}
+
+/// Opens an https URL in the default browser.
+fn open_url(url: &str) {
+    // Handing an arbitrary string to the shell is how "open this link" turns
+    // into "run this command", so only plain https URLs get through.
+    if !url.starts_with("https://") || url.contains(char::is_whitespace) {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        // `explorer <url>` avoids cmd.exe's argument parsing entirely.
+        let _ = std::process::Command::new("explorer").arg(url).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
 

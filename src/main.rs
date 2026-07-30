@@ -10,6 +10,7 @@ mod download;
 mod emit;
 mod i18n;
 mod types;
+mod update;
 mod util;
 
 use eframe::egui;

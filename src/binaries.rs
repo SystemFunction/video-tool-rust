@@ -228,80 +228,94 @@ impl Binaries {
 
     // -- download core --
 
-    /// Streams an HTTPS download into a file (atomic tmp -> rename).
     fn download_to_file(
         &self,
         url: &str,
         target: &PathBuf,
-        mut on_progress: impl FnMut(u64, u64),
+        on_progress: impl FnMut(u64, u64),
     ) -> Result<(), String> {
-        if !url.to_lowercase().starts_with("https://") {
-            return Err(format!("Refusing non-HTTPS download URL: {url}"));
-        }
-        let resp = ureq::get(url)
-            .timeout(Duration::from_secs(180))
-            .call()
-            .map_err(|e| format!("request failed: {e}"))?;
-        // Redirects are followed automatically, so the URL we vetted above is
-        // not necessarily the one that served the bytes. Re-check the final
-        // hop; otherwise a redirect to http:// would silently downgrade the
-        // transport for an executable we are about to run.
-        if !resp.get_url().to_lowercase().starts_with("https://") {
-            return Err(format!(
-                "Refusing redirect to a non-HTTPS URL: {}",
-                resp.get_url()
-            ));
-        }
-        let total: u64 = resp
-            .header("Content-Length")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let tmp = {
-            let mut p = target.clone();
-            let ext = p
-                .extension()
-                .map(|e| format!("{}.part", e.to_string_lossy()))
-                .unwrap_or_else(|| "part".to_string());
-            p.set_extension(ext);
-            p
-        };
-        let mut reader = resp.into_reader();
-        let mut written: u64 = 0;
-        {
-            let mut f = File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
-            let mut buf = vec![0u8; DOWNLOAD_CHUNK];
-            loop {
-                let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
-                if n == 0 {
-                    break;
-                }
-                f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
-                written += n as u64;
-                on_progress(written, total);
-            }
-            f.flush().ok();
-        }
-        fs::rename(&tmp, target).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("rename: {e}")
-        })?;
-        Ok(())
+        download_to_file(url, target, on_progress)
     }
 
     fn sha256_file(path: &PathBuf) -> Result<String, String> {
-        let mut f = File::open(path).map_err(|e| e.to_string())?;
-        let mut hasher = Sha256::new();
+        sha256_file(path)
+    }
+}
+
+/// Streams an HTTPS download into a file (atomic tmp -> rename).
+pub fn download_to_file(
+    url: &str,
+    target: &PathBuf,
+    mut on_progress: impl FnMut(u64, u64),
+) -> Result<(), String> {
+    if !url.to_lowercase().starts_with("https://") {
+        return Err(format!("Refusing non-HTTPS download URL: {url}"));
+    }
+    let resp = ureq::get(url)
+        .timeout(Duration::from_secs(180))
+        .call()
+        .map_err(|e| format!("request failed: {e}"))?;
+    // Redirects are followed automatically, so the URL we vetted above is
+    // not necessarily the one that served the bytes. Re-check the final
+    // hop; otherwise a redirect to http:// would silently downgrade the
+    // transport for an executable we are about to run.
+    if !resp.get_url().to_lowercase().starts_with("https://") {
+        return Err(format!(
+            "Refusing redirect to a non-HTTPS URL: {}",
+            resp.get_url()
+        ));
+    }
+    let total: u64 = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let tmp = {
+        let mut p = target.clone();
+        let ext = p
+            .extension()
+            .map(|e| format!("{}.part", e.to_string_lossy()))
+            .unwrap_or_else(|| "part".to_string());
+        p.set_extension(ext);
+        p
+    };
+    let mut reader = resp.into_reader();
+    let mut written: u64 = 0;
+    {
+        let mut f = File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
         let mut buf = vec![0u8; DOWNLOAD_CHUNK];
         loop {
-            let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+            let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
             if n == 0 {
                 break;
             }
-            hasher.update(&buf[..n]);
+            f.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+            written += n as u64;
+            on_progress(written, total);
         }
-        Ok(format!("{:x}", hasher.finalize()))
+        f.flush().ok();
     }
+    fs::rename(&tmp, target).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("rename: {e}")
+    })?;
+    Ok(())
+}
 
+pub fn sha256_file(path: &PathBuf) -> Result<String, String> {
+    let mut f = File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; DOWNLOAD_CHUNK];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+impl Binaries {
     /// Verifies a freshly downloaded yt-dlp binary against SHA2-256SUMS.
     ///
     /// Fails closed. This binary is executed with the user's privileges on

@@ -1,6 +1,6 @@
 [package]
 name = "video_tool"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Desktop app for downloading videos (yt-dlp) and converting them (FFmpeg) - Rust/egui port"
 license = "MIT"
