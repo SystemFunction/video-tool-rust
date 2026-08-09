@@ -37,7 +37,11 @@ pub enum CheckKind {
     Manual,
 }
 
-#[derive(Clone, Default)]
+/// Serializable so the last probe can be cached across starts (see
+/// `Binaries::fingerprint`); unknown or missing fields fall back to defaults,
+/// which simply invalidates nothing - a bad cache entry is dropped instead.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct BinaryStatus {
     pub ytdlp_ok: bool,
     pub ytdlp_version: String,

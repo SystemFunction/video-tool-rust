@@ -3,7 +3,7 @@
 //! Dropdown tables are `(value, i18n-key)` pairs - the second element is
 //! resolved through `crate::i18n` at draw time, never shown verbatim.
 
-pub const VERSION: &str = "0.1.2";
+pub const VERSION: &str = "0.1.3";
 pub const APP_NAME: &str = "Video Tool";
 
 /// First stable yt-dlp release with the reworked Instagram extractor.
@@ -20,6 +20,11 @@ pub const IMPERSONATE_AUTO_HOSTS: &[&str] = &[
     "facebook.com",
     "fb.watch",
 ];
+
+/// Hosts whose video titles are built from the uploader's name ("Video by
+/// someone"), which would end up in the file name. Downloads from these get a
+/// neutral "video-1234" name instead.
+pub const ANON_NAME_HOSTS: &[&str] = &["instagram.com"];
 
 /// (key, i18n-key) codec choices grouped by category.
 pub fn codec_options(category: &str) -> &'static [(&'static str, &'static str)] {

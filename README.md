@@ -17,7 +17,10 @@ redirects.
 Grab the latest Windows build from the
 [**Releases**](https://github.com/SystemFunction/video-tool-rust/releases/latest)
 page and run `video_tool.exe` — no installation needed. On first launch, open the
-**Setup** tab to install yt-dlp and FFmpeg.
+**Setup** tab to install yt-dlp and FFmpeg. From then on the app offers new
+versions of itself on start and installs them for you.
+
+See the [changelog](CHANGELOG.md) for what changed in each release.
 
 ## Features
 
@@ -28,14 +31,17 @@ page and run `video_tool.exe` — no installation needed. On first launch, open 
   overwrite / skip) with an up-front filename probe, a folder picker for the save
   location, and advanced options: impersonate (anti-bot), SponsorBlock,
   thumbnail/metadata/chapter embedding, subtitles, and PO-token / bgutil support.
-  Live progress log.
+  Live progress log. Instagram downloads are saved under a neutral
+  `video-1234.mp4` name, since their title carries the uploader's account name.
 - **Convert tab** — full codec matrix (H.264/H.265/AV1/VP9, ProRes, DNxHR,
   Vegas Sync Fix, YouTube/social delivery presets, MP3/WAV audio), hardware
   encoder selection (NVENC / AMF / QSV / auto-detect), CRF or custom bitrate,
   HDR-aware color-metadata preservation, and live FFmpeg progress. Browse and
   Save-as file pickers for input/output.
 - **Setup tab** — install/update yt-dlp (Stable/Nightly/Master channels),
-  install FFmpeg (via ffbinaries) and Deno, with status readout.
+  install FFmpeg (via ffbinaries) and Deno, with status readout. The versions
+  shown are cached against the binaries on disk so starting the app costs no
+  process launches; **Re-check** re-reads them on demand.
 - **Info tab** — feature overview.
 - Config persisted as JSON in `~/.video_tool_v3/config.json`.
 

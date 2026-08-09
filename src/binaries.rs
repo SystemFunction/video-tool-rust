@@ -5,9 +5,10 @@
 
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
@@ -194,20 +195,33 @@ impl Binaries {
     }
 
     /// Full status probe (blocking) used by the background worker.
+    ///
+    /// Every line below starts a process, and yt-dlp alone needs a second or
+    /// more just to unpack itself before it prints anything. Run one after
+    /// another that added up to the whole startup delay, so the probes - which
+    /// do not depend on each other - are spread over threads and the wall time
+    /// is now that of the single slowest one.
     pub fn probe_status(&self) -> BinaryStatus {
-        let (ytdlp_ok, ytdlp_version) = self.check_ytdlp();
-        let (ffmpeg_ok, ffmpeg_version) = self.check_ffmpeg();
-        let hw_backend = if ffmpeg_ok {
-            self.detect_hw_encoder()
-        } else {
-            "cpu".into()
-        };
-        let impersonate_ok = if ytdlp_ok {
-            self.supports_impersonation()
-        } else {
-            false
-        };
-        let (deno_ok, deno_version) = self.check_deno();
+        let ((ytdlp_ok, ytdlp_version), (ffmpeg_ok, ffmpeg_version), hw, impersonate, deno) =
+            thread::scope(|s| {
+                let ytdlp = s.spawn(|| self.check_ytdlp());
+                let ffmpeg = s.spawn(|| self.check_ffmpeg());
+                let hw = s.spawn(|| self.detect_hw_encoder());
+                // Started unconditionally; the result is discarded below when
+                // yt-dlp turned out to be missing.
+                let imp = s.spawn(|| self.supports_impersonation());
+                let deno = s.spawn(|| self.check_deno());
+                (
+                    ytdlp.join().unwrap_or((false, "Not found".into())),
+                    ffmpeg.join().unwrap_or((false, "Not found".into())),
+                    hw.join().unwrap_or_else(|_| "cpu".into()),
+                    imp.join().unwrap_or(false),
+                    deno.join().unwrap_or((false, "Not found".into())),
+                )
+            });
+        let hw_backend = if ffmpeg_ok { hw } else { "cpu".into() };
+        let impersonate_ok = ytdlp_ok && impersonate;
+        let (deno_ok, deno_version) = deno;
         let js_runtime = if deno_ok {
             deno_version.split_whitespace().next().unwrap_or("").to_string()
         } else {
@@ -226,6 +240,30 @@ impl Binaries {
         }
     }
 
+    /// Identity of the managed binaries: size and mtime of each local copy.
+    ///
+    /// Used to decide whether a stored probe result still describes the files
+    /// on disk. `None` means "cannot be cached": when yt-dlp or FFmpeg is not
+    /// one of our own copies it comes from PATH, where it can be replaced
+    /// without anything here changing, so those setups always probe for real.
+    /// A JS runtime from PATH is the one thing a hit can go stale on - the
+    /// Setup tab's re-check button exists for exactly that case.
+    pub fn fingerprint(&self) -> Option<String> {
+        if !self.ytdlp_local.exists() || !self.ffmpeg_local.exists() {
+            return None;
+        }
+        let parts: Vec<String> = [
+            &self.ytdlp_local,
+            &self.ffmpeg_local,
+            &self.ffprobe_local,
+            &self.deno_local,
+        ]
+        .iter()
+        .map(|p| file_stamp(p))
+        .collect();
+        Some(parts.join("|"))
+    }
+
     // -- download core --
 
     fn download_to_file(
@@ -239,6 +277,22 @@ impl Binaries {
 
     fn sha256_file(path: &PathBuf) -> Result<String, String> {
         sha256_file(path)
+    }
+}
+
+/// "size:mtime" for a file, or "-" when it does not exist.
+fn file_stamp(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            format!("{}:{}", m.len(), mtime)
+        }
+        Err(_) => "-".to_string(),
     }
 }
 

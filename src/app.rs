@@ -25,6 +25,9 @@ use crate::util;
 
 const MAX_LOG: usize = 1200;
 
+/// Config key holding the last binary probe, see `probe_cache_load`.
+const PROBE_CACHE_KEY: &str = "binary_probe_cache";
+
 struct Toast {
     msg: String,
     error: bool,
@@ -38,7 +41,8 @@ pub struct App {
     tx: Sender<UiMsg>,
     rx: Receiver<UiMsg>,
     status: BinaryStatus,
-    probed: bool,
+    /// True while the background probe thread is running.
+    probing: bool,
     tab: usize,
     lang: Lang,
     toasts: Vec<Toast>,
@@ -193,7 +197,7 @@ impl App {
             config,
             tx,
             rx,
-            probed: false,
+            probing: false,
         };
 
         // Prefill the URL: a clipboard URL wins, otherwise the last used one.
@@ -202,8 +206,15 @@ impl App {
         // Drop the binary a previous update moved aside.
         update::cleanup_backup();
 
-        // Kick off the background binary probe.
-        app.start_probe();
+        // Asking yt-dlp and FFmpeg for their versions costs seconds - both
+        // unpack themselves before they answer - and the answer only changes
+        // when the binaries do. A start that recognises the files it probed
+        // last time therefore skips the probe entirely and is ready at once.
+        let cached = probe_cache_load(&app.config, &app.bin);
+        match cached {
+            Some(status) => app.apply_status(status),
+            None => app.start_probe(),
+        }
         if app.update_auto {
             app.start_update_check(CheckKind::Automatic);
         }
@@ -241,12 +252,24 @@ impl App {
     }
 
     fn start_probe(&mut self) {
-        self.probed = true;
+        if self.probing {
+            return;
+        }
+        self.probing = true;
         let bin = self.bin.clone();
         let em = self.emitter();
         thread::spawn(move || {
             em.send(UiMsg::Binary(bin.probe_status()));
         });
+    }
+
+    /// Adopts a probe result, from the cache or from a fresh run.
+    fn apply_status(&mut self, status: BinaryStatus) {
+        self.probing = false;
+        if !status.impersonate_ok {
+            self.dl_impersonate = false;
+        }
+        self.status = status;
     }
 
     fn start_update_check(&mut self, kind: CheckKind) {
@@ -321,10 +344,8 @@ impl App {
                 UiMsg::SetupLog(s) => self.setup_log = s,
                 UiMsg::SetupBusy(b) => self.setup_busy = b,
                 UiMsg::Binary(status) => {
-                    if !status.impersonate_ok {
-                        self.dl_impersonate = false;
-                    }
-                    self.status = status;
+                    probe_cache_store(&mut self.config, &self.bin, &status);
+                    self.apply_status(status);
                 }
                 UiMsg::Conflict(req) => {
                     self.conflict_name = req.suggestion.clone();
@@ -1247,6 +1268,17 @@ impl App {
             {
                 self.install_deno();
             }
+            // Versions above come from a cache keyed on the binary files, so a
+            // tool installed elsewhere on PATH needs one explicit re-read.
+            if ui
+                .add_enabled(
+                    idle && !self.probing,
+                    egui::Button::new(self.t("setup.recheck")),
+                )
+                .clicked()
+            {
+                self.start_probe();
+            }
         });
         if self.setup_busy {
             ui.add_space(4.0);
@@ -1758,6 +1790,38 @@ fn log_view(ui: &mut egui::Ui, id: &str, lines: &[String], height: f32) {
 fn with_available_right<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add)
         .inner
+}
+
+/// A stored probe result together with what it describes.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProbeCache {
+    /// App version the entry was written by - a new build re-probes once
+    /// rather than trusting a result an older probe produced.
+    app: String,
+    fingerprint: String,
+    status: BinaryStatus,
+}
+
+/// Returns the cached probe result when it still matches the binaries on disk.
+fn probe_cache_load(config: &Config, bin: &Binaries) -> Option<BinaryStatus> {
+    let fingerprint = bin.fingerprint()?;
+    let cached: ProbeCache =
+        serde_json::from_value(config.get_value(PROBE_CACHE_KEY)?.clone()).ok()?;
+    (cached.app == VERSION && cached.fingerprint == fingerprint).then_some(cached.status)
+}
+
+fn probe_cache_store(config: &mut Config, bin: &Binaries, status: &BinaryStatus) {
+    let Some(fingerprint) = bin.fingerprint() else {
+        return;
+    };
+    let entry = ProbeCache {
+        app: VERSION.to_string(),
+        fingerprint,
+        status: status.clone(),
+    };
+    if let Ok(value) = serde_json::to_value(entry) {
+        config.set_value(PROBE_CACHE_KEY, value);
+    }
 }
 
 fn progress_text(lang: Lang, prefix: &str, written: u64, total: u64) -> String {

@@ -72,6 +72,19 @@ impl Config {
         }
     }
 
+    /// Raw access for values that are not a plain string or flag.
+    pub fn get_value(&self, key: &str) -> Option<&Value> {
+        self.data.get(key)
+    }
+
+    pub fn set_value(&mut self, key: &str, value: Value) {
+        if self.data.get(key) == Some(&value) {
+            return;
+        }
+        self.data.insert(key.to_string(), value);
+        self.dirty = true;
+    }
+
     pub fn set_str(&mut self, key: &str, value: &str) {
         if matches!(self.data.get(key), Some(Value::String(s)) if s == value) {
             return;

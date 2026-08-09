@@ -135,6 +135,73 @@ pub fn unique_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Largest number an anonymous "video-N" name may carry.
+const ANON_MAX: u64 = 9999;
+
+/// A random-ish u64 without pulling in an RNG crate.
+///
+/// `RandomState` is seeded from the OS and bumped per instance, so two calls
+/// in the same millisecond still differ - which the time part alone would not
+/// guarantee.
+fn random_u64() -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(nanos);
+    hasher.finish()
+}
+
+/// Picks a "video-N" (N in 1..=9999) that no file in `dir` uses yet.
+///
+/// Only the stem is compared, so "video-7.mp4" also rules out "video-7.webm" -
+/// the extension is yt-dlp's to choose and is not known here.
+pub fn pick_anon_stem(dir: &Path) -> String {
+    let taken: Vec<String> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    Path::new(&e.file_name())
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.to_lowercase())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    free_anon_stem(&taken, std::iter::repeat_with(random_u64).take(64))
+}
+
+/// The draw-to-name half of `pick_anon_stem`, kept pure so the collision
+/// handling can be tested without staging thousands of files.
+fn free_anon_stem(taken: &[String], draws: impl Iterator<Item = u64>) -> String {
+    let free = |n: u64| !taken.contains(&format!("video-{n}"));
+    for draw in draws {
+        let n = draw % ANON_MAX + 1;
+        if free(n) {
+            return format!("video-{n}");
+        }
+    }
+    // Practically unreachable - it takes thousands of "video-N" files in one
+    // folder for every draw to collide. Scan for a gap, and only if the whole
+    // range is taken leave it, rather than hand back a name that is in use.
+    match (1..=ANON_MAX).find(|n| free(*n)) {
+        Some(n) => format!("video-{n}"),
+        None => format!(
+            "video-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ),
+    }
+}
+
 /// Escapes a literal path for use as a yt-dlp output template.
 pub fn escape_outtmpl(path: &str) -> String {
     path.replace('%', "%%")
@@ -254,6 +321,31 @@ mod tests {
     fn outtmpl_escapes_percent_in_the_directory() {
         // '%' starts a field in yt-dlp's template language.
         assert_eq!(escape_outtmpl("C:/50% off/x"), "C:/50%% off/x");
+    }
+
+    #[test]
+    fn anon_stem_stays_inside_the_range() {
+        for draw in [0, 1, ANON_MAX - 1, ANON_MAX, u64::MAX] {
+            let stem = free_anon_stem(&[], std::iter::once(draw));
+            let n: u64 = stem.strip_prefix("video-").unwrap().parse().unwrap();
+            assert!((1..=ANON_MAX).contains(&n), "got {stem}");
+        }
+    }
+
+    #[test]
+    fn anon_stem_skips_names_already_in_the_folder() {
+        // First two draws land on taken numbers, the third does not.
+        let taken = vec!["video-6".to_string(), "video-8".to_string()];
+        let stem = free_anon_stem(&taken, [5, 7, 41].into_iter());
+        assert_eq!(stem, "video-42");
+    }
+
+    #[test]
+    fn anon_stem_falls_back_to_a_scan_when_every_draw_collides() {
+        let taken: Vec<String> = (1..=3).map(|n| format!("video-{n}")).collect();
+        // Every draw maps onto 1..=3, so the scan has to find the first gap.
+        let stem = free_anon_stem(&taken, [0, 1, 2].into_iter());
+        assert_eq!(stem, "video-4");
     }
 
     #[test]

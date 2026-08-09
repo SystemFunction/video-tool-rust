@@ -21,6 +21,11 @@ const RELEASES_PAGE: &str = "https://github.com/SystemFunction/video-tool-rust/r
 /// Suffix of the binary the previous version was moved aside to.
 const BACKUP_SUFFIX: &str = ".old";
 
+/// How often the release query is attempted before giving up.
+const CHECK_ATTEMPTS: u32 = 3;
+/// Multiplied by the attempt number, so the waits are 1s and then 2s.
+const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug)]
 pub struct Release {
     /// Numeric version without the leading "v", e.g. "0.1.2".
@@ -64,16 +69,60 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
     false
 }
 
+/// True for failures that another attempt can plausibly get past.
+///
+/// GitHub's API edge nodes hand out the occasional 502/503/504 that is gone
+/// again seconds later; without a retry that momentary blip surfaces to the
+/// user as a hard "update check failed".
+fn is_transient(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Status(code, _) => matches!(code, 408 | 429 | 500..=599),
+        // Timeouts, DNS hiccups, dropped connections.
+        ureq::Error::Transport(_) => true,
+    }
+}
+
+/// Short, self-explanatory rendering of a failed request.
+///
+/// ureq's own Display repeats the full API URL, which the UI then shows
+/// verbatim behind an already-explanatory prefix.
+fn describe(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => {
+            format!("GitHub returned status {code} - please try again later")
+        }
+        ureq::Error::Transport(t) => format!("could not reach GitHub ({t})"),
+    }
+}
+
+/// Fetches the latest-release document, retrying past transient failures.
+fn fetch_latest() -> Result<serde_json::Value, String> {
+    let mut last = String::new();
+    for attempt in 0..CHECK_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(RETRY_BACKOFF * attempt);
+        }
+        match ureq::get(API_LATEST)
+            .set("Accept", "application/vnd.github+json")
+            .set("User-Agent", &format!("video_tool/{VERSION}"))
+            .timeout(Duration::from_secs(20))
+            .call()
+        {
+            Ok(resp) => {
+                return resp
+                    .into_json()
+                    .map_err(|e| format!("unexpected release data: {e}"))
+            }
+            Err(e) if is_transient(&e) => last = describe(&e),
+            Err(e) => return Err(describe(&e)),
+        }
+    }
+    Err(last)
+}
+
 /// Queries the latest release. `Ok(None)` means "nothing newer than us".
 pub fn check_latest() -> Result<Option<Release>, String> {
-    let body: serde_json::Value = ureq::get(API_LATEST)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", &format!("video_tool/{VERSION}"))
-        .timeout(Duration::from_secs(20))
-        .call()
-        .map_err(|e| format!("update check failed: {e}"))?
-        .into_json()
-        .map_err(|e| format!("unexpected release data: {e}"))?;
+    let body = fetch_latest()?;
 
     let tag = body["tag_name"]
         .as_str()
@@ -217,6 +266,36 @@ mod tests {
     #[test]
     fn a_leading_v_in_the_tag_is_ignored() {
         assert!(!is_newer("v0.1.1".trim_start_matches('v'), "0.1.1"));
+    }
+
+    /// Builds a `ureq::Error::Status` the way a failed request would.
+    fn status_err(code: u16) -> ureq::Error {
+        let resp = ureq::Response::new(code, "", "").unwrap();
+        ureq::Error::Status(code, resp)
+    }
+
+    #[test]
+    fn server_side_failures_are_retried() {
+        for code in [408, 429, 500, 502, 503, 504] {
+            assert!(is_transient(&status_err(code)), "{code} should be retried");
+        }
+    }
+
+    #[test]
+    fn client_side_failures_are_not_retried() {
+        for code in [400, 401, 403, 404] {
+            assert!(
+                !is_transient(&status_err(code)),
+                "{code} should not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_names_the_status_without_repeating_the_url() {
+        let msg = describe(&status_err(504));
+        assert!(msg.contains("504"), "{msg}");
+        assert!(!msg.contains("api.github.com"), "{msg}");
     }
 
     #[test]

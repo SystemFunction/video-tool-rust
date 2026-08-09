@@ -12,7 +12,7 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::binaries::{no_window, Binaries};
-use crate::consts::{IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX};
+use crate::consts::{ANON_NAME_HOSTS, IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX};
 use crate::emit::Emitter;
 use crate::i18n::{t, tf, Lang};
 use crate::types::{ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg};
@@ -253,6 +253,24 @@ pub fn build_download_cmd(
     cmd
 }
 
+/// For hosts that put the uploader's name into the title, returns the output
+/// template for a neutral "video-1234.<ext>" plus that stem for the log.
+///
+/// The number is drawn once per download so the pre-flight name probe and the
+/// download itself agree on the target.
+fn anon_outtmpl(url: &str, out_dir: &str) -> Option<(String, String)> {
+    let lo = url.to_lowercase();
+    if !ANON_NAME_HOSTS.iter().any(|h| lo.contains(h)) {
+        return None;
+    }
+    let stem = util::pick_anon_stem(Path::new(out_dir));
+    // The stem is "video-<digits>" and carries no '%', so only the directory
+    // needs escaping before the template is joined onto it.
+    let mut tmpl = PathBuf::from(util::escape_outtmpl(&Path::new(out_dir).to_string_lossy()));
+    tmpl.push(format!("{stem}.%(ext)s"));
+    Some((tmpl.to_string_lossy().to_string(), stem))
+}
+
 fn spawn(bin: &Binaries, args: &[String]) -> Command {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
@@ -482,8 +500,17 @@ fn run_download_inner(
 ) {
     log_preflight_hints(ctx, url, quality, cookies, opts);
 
-    let (outtmpl, force_overwrite, cancelled) =
-        resolve_conflict(ctx, url, out_dir, quality, cookies, opts);
+    // A freshly drawn "video-1234" is already known to be free, so the whole
+    // conflict dance - including a second yt-dlp run just to learn the target
+    // name - is skipped and the download starts right away.
+    let anon = anon_outtmpl(url, out_dir);
+    let (outtmpl, force_overwrite, cancelled) = match &anon {
+        Some((tmpl, stem)) => {
+            ctx.em.log(Task::Download, ctx.tf("dlw.anon_name", &[stem]));
+            (Some(tmpl.clone()), false, false)
+        }
+        None => resolve_conflict(ctx, url, out_dir, quality, cookies, opts),
+    };
     if cancelled {
         let stopped = ctx.cancel.load(Ordering::SeqCst);
         ctx.em.progress(Task::Download, -1.0);
@@ -637,4 +664,27 @@ fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_uploader_named_hosts_get_an_anonymous_name() {
+        assert!(anon_outtmpl("https://www.youtube.com/watch?v=abc", ".").is_none());
+        assert!(anon_outtmpl("https://www.instagram.com/reel/abc/", ".").is_some());
+        // Host matching must not care about the case of the typed URL.
+        assert!(anon_outtmpl("https://www.INSTAGRAM.com/reel/abc/", ".").is_some());
+    }
+
+    #[test]
+    fn the_anonymous_template_carries_no_title_field() {
+        let (tmpl, stem) = anon_outtmpl("https://instagram.com/p/abc/", "out 50%").unwrap();
+        assert!(tmpl.starts_with("out 50%%"), "directory not escaped: {tmpl}");
+        assert!(tmpl.ends_with(&format!("{stem}.%(ext)s")), "got {tmpl}");
+        assert!(!tmpl.contains("%(title)"), "got {tmpl}");
+        let n: u64 = stem.strip_prefix("video-").unwrap().parse().unwrap();
+        assert!((1..=9999).contains(&n), "got {stem}");
+    }
 }

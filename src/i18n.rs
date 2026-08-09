@@ -296,6 +296,7 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
         "setup.channel" => ("Channel:", "Kanal:", "Canal :"),
         "setup.update_ytdlp" => ("⟳ Update yt-dlp", "⟳ yt-dlp aktualisieren", "⟳ Mettre à jour yt-dlp"),
         "setup.install_deno" => ("Install Deno", "Deno installieren", "Installer Deno"),
+        "setup.recheck" => ("⟳ Re-check", "⟳ Neu prüfen", "⟳ Revérifier"),
         "setup.busy_hint" => (
             "An installation is already running - please wait.",
             "Eine Installation läuft bereits - bitte warten.",
@@ -664,6 +665,11 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Remarque : impossible de déterminer le nom du fichier cible à l'avance - si un fichier du même nom existe, yt-dlp ignorera le téléchargement.",
         ),
         "dlw.target_file" => ("Target file: {}", "Zieldatei: {}", "Fichier cible : {}"),
+        "dlw.anon_name" => (
+            "Saving as \"{}\" - the uploader's name is left out of the file name.",
+            "Wird als „{}“ gespeichert - der Name des Uploaders kommt nicht in den Dateinamen.",
+            "Enregistré sous « {} » - le nom de l'auteur n'apparaît pas dans le nom du fichier.",
+        ),
         "dlw.exists_saving_as" => (
             "\"{}\" already exists - saving as \"{}\".",
             "„{}“ existiert bereits - speichere als „{}“.",
