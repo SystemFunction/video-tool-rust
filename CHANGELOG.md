@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-08-16
+
+### Fixed
+
+- WAV downloads no longer fail at the very end with *"Supported filetypes for
+  thumbnail embedding are: mp3, mkv/mka, ogg/opus/flac, m4a/mp4/m4v/mov"*. A
+  WAV file has nowhere to put cover art, so with **Embed thumbnail/metadata**
+  switched on the last post-processing step aborted the run even though the
+  audio had already been written. Thumbnail embedding is now skipped for WAV
+  only; metadata and chapters are still written, and every other format keeps
+  its cover art.
+- YouTube downloads that died part-way through with *"unable to download video
+  data: HTTP Error 403: Forbidden"* are retried automatically. yt-dlp's own
+  retries reuse the media URL that just stopped working, so they cannot get
+  past this; the download is now repeated with a freshly extracted URL, keeping
+  what the interrupted attempt already wrote, and a third attempt leaves out
+  the player clients whose links YouTube tends to cut off.
+
+### Changed
+
+- YouTube's format list is now assembled from yt-dlp's own client rotation
+  first. `web_safari` used to be asked first even though YouTube serves that
+  client over SABR without a PO token — most of its formats arrive without a
+  usable link, and the few that do not are exactly the ones that stop mid
+  transfer.
+- The failure diagnosis in the log also reads yt-dlp's error output, not just
+  its progress output, so the existing hints (Instagram bug, missing formats,
+  missing JS runtime) actually appear — plus a new one for a rejected transfer.
+
 ## [0.1.3] - 2026-08-09
 
 ### Added
@@ -84,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.1.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.4
 [0.1.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.3
 [0.1.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.2
 [0.1.0]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.0

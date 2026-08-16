@@ -744,6 +744,17 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Tipp: Die Seite hat Formate zurückgehalten oder verlangt einen Login. Cookies setzen (cookies.txt), Deno installieren oder yt-dlp aktualisieren.",
             "Astuce : le site a retenu des formats ou exige une connexion. Définissez des cookies (cookies.txt), installez Deno ou mettez yt-dlp à jour.",
         ),
+        "dlw.retrying" => (
+            "Transfer was rejected mid-download - fetching fresh links (attempt {} of {})...",
+            "Übertragung wurde mittendrin abgewiesen - hole frische Links (Versuch {} von {})...",
+            "Transfert refusé en cours de route - récupération de nouveaux liens (tentative {} sur {})...",
+        ),
+        "dlw.retry_status" => ("Retrying...", "Neuer Versuch...", "Nouvelle tentative..."),
+        "dlw.tip_403" => (
+            "Tip: YouTube rejected the transfer (403). This usually clears up on its own; cookies or a PO token make it rarer.",
+            "Tipp: YouTube hat die Übertragung abgewiesen (403). Das legt sich meist von selbst; mit Cookies oder PO Token passiert es seltener.",
+            "Astuce : YouTube a refusé le transfert (403). Cela se résout généralement tout seul ; des cookies ou un jeton PO le rendent plus rare.",
+        ),
         "dlw.tip_nojs" => (
             "Tip: no JS runtime detected. Setup tab -> 'Install Deno' (needed for the YouTube n-challenge).",
             "Tipp: Keine JS-Laufzeit erkannt. Reiter Einrichtung -> „Deno installieren“ (nötig für die YouTube-n-Challenge).",

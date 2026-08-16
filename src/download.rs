@@ -20,6 +20,21 @@ use crate::util;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// The attempts a download gets, in order. The first entry is the normal run;
+/// each further one is only reached after a failure that looks transient.
+const RETRY_PLAN: [Retry; 3] = [
+    Retry { safe_clients: false, resume: false },
+    // Same formats, fresh URLs, and keep what the interrupted run wrote.
+    Retry { safe_clients: false, resume: true },
+    // Still failing: the URLs themselves are the problem, so leave the web
+    // player clients out entirely.
+    Retry { safe_clients: true, resume: true },
+];
+
+/// Breather between attempts - retrying a rejection instantly tends to earn
+/// another one.
+const RETRY_PAUSE: Duration = Duration::from_secs(3);
+
 type ChildSlot = Arc<Mutex<Option<Child>>>;
 
 pub struct DlCtx {
@@ -41,6 +56,28 @@ impl DlCtx {
     }
 }
 
+/// How a repeated attempt differs from the first one.
+///
+/// YouTube hands out media URLs that can stop working part-way through the
+/// transfer, so a retry is only useful if it extracts fresh ones - and if it
+/// keeps what the interrupted attempt already wrote.
+#[derive(Clone, Copy, Default)]
+pub struct Retry {
+    /// Drop the web player clients, whose URLs are the ones that die.
+    pub safe_clients: bool,
+    /// Keep the partial file even when the user asked to overwrite.
+    pub resume: bool,
+}
+
+/// What this particular run should write, and how hard it should try.
+#[derive(Clone, Copy, Default)]
+pub struct Attempt<'a> {
+    /// Output template replacing the default one, e.g. a renamed target.
+    pub outtmpl: Option<&'a str>,
+    pub force_overwrite: bool,
+    pub retry: Retry,
+}
+
 /// Builds the yt-dlp command line as (program, args...).
 pub fn build_download_cmd(
     bin: &Binaries,
@@ -49,9 +86,9 @@ pub fn build_download_cmd(
     quality: &str,
     cookies: &Option<String>,
     opts: &DownloadOpts,
-    outtmpl: Option<&str>,
-    force_overwrite: bool,
+    attempt: Attempt,
 ) -> Vec<String> {
+    let Attempt { outtmpl, force_overwrite, retry } = attempt;
     let mut cmd: Vec<String> = vec![bin.ytdlp_path()];
     let push = |c: &mut Vec<String>, items: &[&str]| {
         for it in items {
@@ -167,16 +204,32 @@ pub fn build_download_cmd(
     ];
     if force_overwrite {
         base.push("--force-overwrites".into());
+        // --force-overwrites implies --no-continue. On a retry the half-written
+        // file is from our own interrupted attempt, so resuming it is right;
+        // the later option wins, and overwriting stays on.
+        if retry.resume {
+            base.push("--continue".into());
+        }
     }
 
     // YouTube player clients
     let has_cookies = cookies.is_some() || !opts.cookiefile.is_empty();
-    let player_clients = if opts.potoken {
+    let player_clients = if retry.safe_clients {
+        // Unless a PO token is supplied, YouTube pushes the web clients onto
+        // SABR streaming: most of their formats come back without a URL, and
+        // the few that keep one are bound to a token we do not have, so the
+        // CDN starts answering 403 a few percent into the transfer. The
+        // default rotation and the VR client still serve plain URLs.
+        "default,android_vr"
+    } else if opts.potoken {
         "mweb,tv_simply,web_safari,web_embedded,web_creator"
     } else if has_cookies {
         "default,web_safari,web_creator,web_embedded"
     } else {
-        "web_safari,default"
+        // Default first: yt-dlp's own rotation picks clients that actually
+        // hand out downloadable URLs, and whatever it finds must not be
+        // shadowed by a same-numbered SABR format from web_safari.
+        "default,web_safari"
     };
     base.push("--extractor-args".into());
     base.push(format!("youtube:player_client={player_clients}"));
@@ -196,7 +249,12 @@ pub fn build_download_cmd(
     }
 
     if opts.embed {
-        base.push("--embed-thumbnail".into());
+        // WAV has no container slot for cover art - yt-dlp aborts the whole
+        // postprocessing chain with "Supported filetypes for thumbnail
+        // embedding are: ..." if we ask for it anyway.
+        if quality != "audio_wav" {
+            base.push("--embed-thumbnail".into());
+        }
         base.push("--embed-metadata".into());
         base.push("--embed-chapters".into());
     }
@@ -290,7 +348,7 @@ fn probe_target_path(
     cookies: &Option<String>,
     opts: &DownloadOpts,
 ) -> Option<PathBuf> {
-    let cmd = build_download_cmd(&ctx.bin, url, out_dir, quality, cookies, opts, None, false);
+    let cmd = build_download_cmd(&ctx.bin, url, out_dir, quality, cookies, opts, Attempt::default());
     // Same command, but simulated and printing only the resulting file name.
     let mut probe: Vec<String> = cmd[..cmd.len() - 1].to_vec();
     probe.extend([
@@ -490,54 +548,20 @@ pub fn run_download(
     ctx.em.busy(Task::Download, false);
 }
 
-fn run_download_inner(
-    ctx: &DlCtx,
-    url: &str,
-    out_dir: &str,
-    quality: &str,
-    cookies: &Option<String>,
-    opts: &DownloadOpts,
-) {
-    log_preflight_hints(ctx, url, quality, cookies, opts);
+/// What one yt-dlp run ended up doing.
+struct RunOutcome {
+    code: i32,
+    skipped_existing: bool,
+    /// Everything the run printed on either stream, lowercased.
+    logs: String,
+}
 
-    // A freshly drawn "video-1234" is already known to be free, so the whole
-    // conflict dance - including a second yt-dlp run just to learn the target
-    // name - is skipped and the download starts right away.
-    let anon = anon_outtmpl(url, out_dir);
-    let (outtmpl, force_overwrite, cancelled) = match &anon {
-        Some((tmpl, stem)) => {
-            ctx.em.log(Task::Download, ctx.tf("dlw.anon_name", &[stem]));
-            (Some(tmpl.clone()), false, false)
-        }
-        None => resolve_conflict(ctx, url, out_dir, quality, cookies, opts),
-    };
-    if cancelled {
-        let stopped = ctx.cancel.load(Ordering::SeqCst);
-        ctx.em.progress(Task::Download, -1.0);
-        if stopped {
-            ctx.em.status(Task::Download, ctx.t("status.cancelled"));
-            ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
-        } else {
-            ctx.em.status(Task::Download, ctx.t("dlw.skipped_status"));
-            ctx.em.log(Task::Download, ctx.t("dlw.skipped_log"));
-            ctx.em.toast(ctx.t("dlw.skipped_toast"), true);
-        }
-        return;
-    }
-
-    let cmd = build_download_cmd(
-        &ctx.bin,
-        url,
-        out_dir,
-        quality,
-        cookies,
-        opts,
-        outtmpl.as_deref(),
-        force_overwrite,
-    );
-    ctx.em.status(Task::Download, ctx.t("status.downloading"));
-
-    let mut command = spawn(&ctx.bin, &cmd);
+/// Runs yt-dlp once, feeding progress and log lines to the UI.
+///
+/// `None` means the process could not be started at all - status and log
+/// already say so.
+fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
+    let mut command = spawn(&ctx.bin, cmd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -545,22 +569,26 @@ fn run_download_inner(
             ctx.em
                 .log(Task::Download, ctx.tf("common.error", &[&e.to_string()]));
             ctx.em.status(Task::Download, ctx.t("dlw.failed"));
-            return;
+            return None;
         }
     };
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         ctx.em.status(Task::Download, ctx.t("dlw.failed"));
-        return;
+        return None;
     };
     *util::lock(&ctx.child) = Some(child);
 
-    // Forward stderr to the log on a helper thread.
+    // Forward stderr to the log on a helper thread. yt-dlp reports its errors
+    // there, so the collected copy is what the diagnosis below reads.
+    let collected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let em_err = ctx.em.clone();
+    let err_lines = Arc::clone(&collected);
     let err_handle = thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             let t = line.trim();
             if !t.is_empty() {
+                util::lock(&err_lines).push(t.to_lowercase());
                 em_err.log(Task::Download, t.to_string());
             }
         }
@@ -570,7 +598,6 @@ fn run_download_inner(
     let generic_re = Regex::new(r"(\d+(?:\.\d+)?)%").unwrap();
     let mut last_progress = String::new();
     let mut skipped_existing = false;
-    let mut all_logs: Vec<String> = Vec::new();
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         let line = line.trim().to_string();
@@ -580,7 +607,7 @@ fn run_download_inner(
         let is_progress = line.starts_with("download:");
         if !(is_progress && line == last_progress) {
             ctx.em.log(Task::Download, line.clone());
-            all_logs.push(line.to_lowercase());
+            util::lock(&collected).push(line.to_lowercase());
         }
         if is_progress {
             last_progress = line.clone();
@@ -621,6 +648,125 @@ fn run_download_inner(
         None => -1, // Stop already killed it
     };
 
+    let logs = util::lock(&collected).join("\n");
+    Some(RunOutcome {
+        code,
+        skipped_existing,
+        logs,
+    })
+}
+
+/// Whether a failed run is one that a second, freshly extracted attempt has a
+/// real chance of getting through.
+///
+/// The 403 is the interesting one: YouTube accepts the first few megabytes and
+/// then rejects the rest of the transfer, which yt-dlp's own `--retries` cannot
+/// fix because they reuse the very URL that just died.
+fn is_transient_failure(logs: &str) -> bool {
+    const NEEDLES: [&str; 7] = [
+        "http error 403",
+        "unable to download video data",
+        "http error 500",
+        "http error 502",
+        "http error 503",
+        "connection reset",
+        "the read operation timed out",
+    ];
+    NEEDLES.iter().any(|n| logs.contains(n))
+}
+
+/// Sleeps unless Stop is pressed; `false` means the wait was cut short.
+fn sleep_cancellable(ctx: &DlCtx, total: Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    while std::time::Instant::now() < deadline {
+        if ctx.cancel.load(Ordering::SeqCst) {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    true
+}
+
+fn run_download_inner(
+    ctx: &DlCtx,
+    url: &str,
+    out_dir: &str,
+    quality: &str,
+    cookies: &Option<String>,
+    opts: &DownloadOpts,
+) {
+    log_preflight_hints(ctx, url, quality, cookies, opts);
+
+    // A freshly drawn "video-1234" is already known to be free, so the whole
+    // conflict dance - including a second yt-dlp run just to learn the target
+    // name - is skipped and the download starts right away.
+    let anon = anon_outtmpl(url, out_dir);
+    let (outtmpl, force_overwrite, cancelled) = match &anon {
+        Some((tmpl, stem)) => {
+            ctx.em.log(Task::Download, ctx.tf("dlw.anon_name", &[stem]));
+            (Some(tmpl.clone()), false, false)
+        }
+        None => resolve_conflict(ctx, url, out_dir, quality, cookies, opts),
+    };
+    if cancelled {
+        let stopped = ctx.cancel.load(Ordering::SeqCst);
+        ctx.em.progress(Task::Download, -1.0);
+        if stopped {
+            ctx.em.status(Task::Download, ctx.t("status.cancelled"));
+            ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
+        } else {
+            ctx.em.status(Task::Download, ctx.t("dlw.skipped_status"));
+            ctx.em.log(Task::Download, ctx.t("dlw.skipped_log"));
+            ctx.em.toast(ctx.t("dlw.skipped_toast"), true);
+        }
+        return;
+    }
+
+    // The media URLs YouTube hands out can stop working part-way through the
+    // transfer; a fresh run gets fresh ones, so a stalled 403 is retried here
+    // instead of being reported as a dead end.
+    let mut attempt = 0usize;
+    let (code, skipped_existing, joined) = loop {
+        let cmd = build_download_cmd(
+            &ctx.bin,
+            url,
+            out_dir,
+            quality,
+            cookies,
+            opts,
+            Attempt {
+                outtmpl: outtmpl.as_deref(),
+                force_overwrite,
+                retry: RETRY_PLAN[attempt],
+            },
+        );
+        ctx.em.status(Task::Download, ctx.t("status.downloading"));
+
+        let Some(run) = run_ytdlp(ctx, &cmd) else {
+            return;
+        };
+        let last = attempt + 1 >= RETRY_PLAN.len();
+        if run.code == 0
+            || last
+            || ctx.cancel.load(Ordering::SeqCst)
+            || !is_transient_failure(&run.logs)
+        {
+            break (run.code, run.skipped_existing, run.logs);
+        }
+        attempt += 1;
+        ctx.em.log(
+            Task::Download,
+            ctx.tf(
+                "dlw.retrying",
+                &[&attempt.to_string(), &(RETRY_PLAN.len() - 1).to_string()],
+            ),
+        );
+        ctx.em.status(Task::Download, ctx.t("dlw.retry_status"));
+        if !sleep_cancellable(ctx, RETRY_PAUSE) {
+            break (run.code, run.skipped_existing, run.logs);
+        }
+    };
+
     let cancelled = ctx.cancel.load(Ordering::SeqCst);
     if cancelled {
         ctx.em.status(Task::Download, ctx.t("status.cancelled"));
@@ -642,7 +788,6 @@ fn run_download_inner(
             Task::Download,
             ctx.tf("dlw.failed_log", &[&code.to_string()]),
         );
-        let joined = all_logs.join("\n");
         if joined.contains("empty media response") {
             ctx.em.log(
                 Task::Download,
@@ -653,6 +798,8 @@ fn run_download_inner(
             || joined.contains("login required")
         {
             ctx.em.log(Task::Download, ctx.t("dlw.tip_formats"));
+        } else if is_transient_failure(&joined) {
+            ctx.em.log(Task::Download, ctx.t("dlw.tip_403"));
         } else if ctx.js_runtime.is_empty() {
             ctx.em.log(Task::Download, ctx.t("dlw.tip_nojs"));
         }
@@ -676,6 +823,67 @@ mod tests {
         assert!(anon_outtmpl("https://www.instagram.com/reel/abc/", ".").is_some());
         // Host matching must not care about the case of the typed URL.
         assert!(anon_outtmpl("https://www.INSTAGRAM.com/reel/abc/", ".").is_some());
+    }
+
+    /// The joined command line, for substring assertions.
+    fn cmd_line(quality: &str, opts: &DownloadOpts, force_overwrite: bool, retry: Retry) -> String {
+        let bin = Binaries::new();
+        build_download_cmd(
+            &bin,
+            "https://www.youtube.com/watch?v=abc",
+            "out",
+            quality,
+            &None,
+            opts,
+            Attempt { outtmpl: None, force_overwrite, retry },
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn wav_never_asks_for_a_thumbnail() {
+        let opts = DownloadOpts { embed: true, ..Default::default() };
+        assert!(!cmd_line("audio_wav", &opts, false, Retry::default()).contains("--embed-thumbnail"));
+        // The formats that can hold one still get it.
+        for q in ["audio", "audio_opus", "1080"] {
+            let line = cmd_line(q, &opts, false, Retry::default());
+            assert!(line.contains("--embed-thumbnail"), "{q}: {line}");
+        }
+    }
+
+    #[test]
+    fn the_default_client_rotation_comes_before_web_safari() {
+        let line = cmd_line("1080", &DownloadOpts::default(), false, Retry::default());
+        assert!(line.contains("player_client=default,web_safari"), "{line}");
+    }
+
+    #[test]
+    fn the_last_attempt_drops_the_web_clients_and_resumes() {
+        let last = *RETRY_PLAN.last().unwrap();
+        let line = cmd_line("1080", &DownloadOpts::default(), true, last);
+        assert!(!line.contains("web_safari"), "{line}");
+        // --force-overwrites turns resuming off, so it has to be turned back on
+        // after it - the later option is the one yt-dlp honours.
+        let force = line.find("--force-overwrites").unwrap();
+        let cont = line.find("--continue").unwrap();
+        assert!(force < cont, "{line}");
+    }
+
+    #[test]
+    fn only_the_first_attempt_starts_from_scratch() {
+        assert!(!RETRY_PLAN[0].resume);
+        assert!(RETRY_PLAN[1..].iter().all(|r| r.resume));
+        assert!(!cmd_line("1080", &DownloadOpts::default(), true, RETRY_PLAN[0]).contains("--continue"));
+    }
+
+    #[test]
+    fn a_mid_transfer_rejection_is_worth_another_run() {
+        assert!(is_transient_failure(
+            "error: unable to download video data: http error 403: forbidden"
+        ));
+        // A missing format or a login wall will not go away on a retry.
+        assert!(!is_transient_failure("error: requested format is not available"));
+        assert!(!is_transient_failure("error: sign in to confirm your age"));
     }
 
     #[test]
