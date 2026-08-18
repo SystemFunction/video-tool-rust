@@ -3,7 +3,7 @@
 //! Dropdown tables are `(value, i18n-key)` pairs - the second element is
 //! resolved through `crate::i18n` at draw time, never shown verbatim.
 
-pub const VERSION: &str = "0.1.4";
+pub const VERSION: &str = "0.1.5";
 pub const APP_NAME: &str = "Video Tool";
 
 /// First stable yt-dlp release with the reworked Instagram extractor.

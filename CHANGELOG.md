@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-08-19
+
+### Changed
+
+- A YouTube transfer that is rejected mid-download (*"HTTP Error 403:
+  Forbidden"*) now drops the web player clients on the very next attempt
+  instead of the third. Re-extracting from the same clients hands back the same
+  SABR formats, so that middle run was spending a retry on an attempt that had
+  already been shown not to work. Plain network failures (500/502/503, reset
+  connections, timeouts) still keep their formats and only fetch fresh links.
+- Retries fetch the fragments one at a time. Eight parallel range requests on a
+  URL the CDN is already unhappy with tend to earn another rejection; the first
+  attempt keeps its eight.
+
 ## [0.1.4] - 2026-08-16
 
 ### Fixed
@@ -113,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.1.5]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.5
 [0.1.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.4
 [0.1.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.3
 [0.1.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.2

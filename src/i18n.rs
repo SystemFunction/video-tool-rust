@@ -745,9 +745,14 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Astuce : le site a retenu des formats ou exige une connexion. Définissez des cookies (cookies.txt), installez Deno ou mettez yt-dlp à jour.",
         ),
         "dlw.retrying" => (
-            "Transfer was rejected mid-download - fetching fresh links (attempt {} of {})...",
-            "Übertragung wurde mittendrin abgewiesen - hole frische Links (Versuch {} von {})...",
-            "Transfert refusé en cours de route - récupération de nouveaux liens (tentative {} sur {})...",
+            "Transfer was rejected mid-download - retrying without the web player clients (attempt {} of {})...",
+            "Übertragung wurde mittendrin abgewiesen - neuer Versuch ohne die Web-Player-Clients (Versuch {} von {})...",
+            "Transfert refusé en cours de route - nouvelle tentative sans les clients web (tentative {} sur {})...",
+        ),
+        "dlw.retrying_net" => (
+            "Connection gave out - fetching fresh links (attempt {} of {})...",
+            "Verbindung abgebrochen - hole frische Links (Versuch {} von {})...",
+            "Connexion interrompue - récupération de nouveaux liens (tentative {} sur {})...",
         ),
         "dlw.retry_status" => ("Retrying...", "Neuer Versuch...", "Nouvelle tentative..."),
         "dlw.tip_403" => (

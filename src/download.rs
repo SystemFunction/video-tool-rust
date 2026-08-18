@@ -20,16 +20,15 @@ use crate::util;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The attempts a download gets, in order. The first entry is the normal run;
-/// each further one is only reached after a failure that looks transient.
-const RETRY_PLAN: [Retry; 3] = [
-    Retry { safe_clients: false, resume: false },
-    // Same formats, fresh URLs, and keep what the interrupted run wrote.
-    Retry { safe_clients: false, resume: true },
-    // Still failing: the URLs themselves are the problem, so leave the web
-    // player clients out entirely.
-    Retry { safe_clients: true, resume: true },
-];
+/// How many runs a single download gets: the normal one plus two retries.
+const MAX_ATTEMPTS: usize = 3;
+
+/// How the very first run is configured - no retry concessions yet.
+const FIRST_ATTEMPT: Retry = Retry {
+    safe_clients: false,
+    resume: false,
+    low_concurrency: false,
+};
 
 /// Breather between attempts - retrying a rejection instantly tends to earn
 /// another one.
@@ -67,6 +66,30 @@ pub struct Retry {
     pub safe_clients: bool,
     /// Keep the partial file even when the user asked to overwrite.
     pub resume: bool,
+    /// Fetch the fragments one at a time. Eight parallel range requests on a
+    /// URL the CDN is already unhappy with only invite another rejection.
+    pub low_concurrency: bool,
+}
+
+/// Why a run failed, as far as it changes what the next one should do.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Failure {
+    /// The CDN turned the transfer down (403). The URLs are the problem.
+    Rejected,
+    /// The connection or the server gave out - the same formats are still fine.
+    Flaky,
+}
+
+/// The run that follows `prev` after a `kind` failure.
+fn next_retry(prev: Retry, kind: Failure) -> Retry {
+    Retry {
+        // Re-extracting from the same web clients hands back the same SABR
+        // formats, so a rejection goes straight to the clients that still
+        // serve plain URLs instead of spending a run on an identical attempt.
+        safe_clients: prev.safe_clients || kind == Failure::Rejected,
+        resume: true,
+        low_concurrency: true,
+    }
 }
 
 /// What this particular run should write, and how hard it should try.
@@ -189,7 +212,7 @@ pub fn build_download_cmd(
         "--fragment-retries".into(),
         "10".into(),
         "--concurrent-fragments".into(),
-        "8".into(),
+        if retry.low_concurrency { "1".into() } else { "8".into() },
         "--extractor-retries".into(),
         "3".into(),
         "--throttled-rate".into(),
@@ -656,23 +679,29 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     })
 }
 
-/// Whether a failed run is one that a second, freshly extracted attempt has a
-/// real chance of getting through.
+/// Classifies a failed run, or `None` if a second attempt would be pointless.
 ///
 /// The 403 is the interesting one: YouTube accepts the first few megabytes and
 /// then rejects the rest of the transfer, which yt-dlp's own `--retries` cannot
-/// fix because they reuse the very URL that just died.
-fn is_transient_failure(logs: &str) -> bool {
-    const NEEDLES: [&str; 7] = [
-        "http error 403",
-        "unable to download video data",
+/// fix because they reuse the very URL that just died. It is told apart from
+/// the plain network hiccups because only it says something about the formats
+/// that were picked.
+fn failure_kind(logs: &str) -> Option<Failure> {
+    const REJECTED: [&str; 2] = ["http error 403", "unable to download video data"];
+    const FLAKY: [&str; 5] = [
         "http error 500",
         "http error 502",
         "http error 503",
         "connection reset",
         "the read operation timed out",
     ];
-    NEEDLES.iter().any(|n| logs.contains(n))
+    if REJECTED.iter().any(|n| logs.contains(n)) {
+        Some(Failure::Rejected)
+    } else if FLAKY.iter().any(|n| logs.contains(n)) {
+        Some(Failure::Flaky)
+    } else {
+        None
+    }
 }
 
 /// Sleeps unless Stop is pressed; `false` means the wait was cut short.
@@ -726,6 +755,7 @@ fn run_download_inner(
     // transfer; a fresh run gets fresh ones, so a stalled 403 is retried here
     // instead of being reported as a dead end.
     let mut attempt = 0usize;
+    let mut retry = FIRST_ATTEMPT;
     let (code, skipped_existing, joined) = loop {
         let cmd = build_download_cmd(
             &ctx.bin,
@@ -737,7 +767,7 @@ fn run_download_inner(
             Attempt {
                 outtmpl: outtmpl.as_deref(),
                 force_overwrite,
-                retry: RETRY_PLAN[attempt],
+                retry,
             },
         );
         ctx.em.status(Task::Download, ctx.t("status.downloading"));
@@ -745,20 +775,23 @@ fn run_download_inner(
         let Some(run) = run_ytdlp(ctx, &cmd) else {
             return;
         };
-        let last = attempt + 1 >= RETRY_PLAN.len();
-        if run.code == 0
-            || last
-            || ctx.cancel.load(Ordering::SeqCst)
-            || !is_transient_failure(&run.logs)
-        {
+        let spent = attempt + 1 >= MAX_ATTEMPTS || ctx.cancel.load(Ordering::SeqCst);
+        let next = failure_kind(&run.logs).filter(|_| run.code != 0 && !spent);
+        let Some(kind) = next else {
             break (run.code, run.skipped_existing, run.logs);
-        }
+        };
         attempt += 1;
+        retry = next_retry(retry, kind);
+        let msg = if kind == Failure::Rejected {
+            "dlw.retrying"
+        } else {
+            "dlw.retrying_net"
+        };
         ctx.em.log(
             Task::Download,
             ctx.tf(
-                "dlw.retrying",
-                &[&attempt.to_string(), &(RETRY_PLAN.len() - 1).to_string()],
+                msg,
+                &[&attempt.to_string(), &(MAX_ATTEMPTS - 1).to_string()],
             ),
         );
         ctx.em.status(Task::Download, ctx.t("dlw.retry_status"));
@@ -798,7 +831,7 @@ fn run_download_inner(
             || joined.contains("login required")
         {
             ctx.em.log(Task::Download, ctx.t("dlw.tip_formats"));
-        } else if is_transient_failure(&joined) {
+        } else if failure_kind(&joined) == Some(Failure::Rejected) {
             ctx.em.log(Task::Download, ctx.t("dlw.tip_403"));
         } else if ctx.js_runtime.is_empty() {
             ctx.em.log(Task::Download, ctx.t("dlw.tip_nojs"));
@@ -858,9 +891,9 @@ mod tests {
     }
 
     #[test]
-    fn the_last_attempt_drops_the_web_clients_and_resumes() {
-        let last = *RETRY_PLAN.last().unwrap();
-        let line = cmd_line("1080", &DownloadOpts::default(), true, last);
+    fn a_rejection_drops_the_web_clients_right_away() {
+        let second = next_retry(FIRST_ATTEMPT, Failure::Rejected);
+        let line = cmd_line("1080", &DownloadOpts::default(), true, second);
         assert!(!line.contains("web_safari"), "{line}");
         // --force-overwrites turns resuming off, so it has to be turned back on
         // after it - the later option is the one yt-dlp honours.
@@ -870,20 +903,40 @@ mod tests {
     }
 
     #[test]
-    fn only_the_first_attempt_starts_from_scratch() {
-        assert!(!RETRY_PLAN[0].resume);
-        assert!(RETRY_PLAN[1..].iter().all(|r| r.resume));
-        assert!(!cmd_line("1080", &DownloadOpts::default(), true, RETRY_PLAN[0]).contains("--continue"));
+    fn a_network_hiccup_keeps_the_formats_it_had() {
+        let second = next_retry(FIRST_ATTEMPT, Failure::Flaky);
+        assert!(cmd_line("1080", &DownloadOpts::default(), false, second).contains("web_safari"));
+        // Once dropped, the web clients stay dropped for the rest of the run.
+        let third = next_retry(next_retry(FIRST_ATTEMPT, Failure::Rejected), Failure::Flaky);
+        assert!(!cmd_line("1080", &DownloadOpts::default(), false, third).contains("web_safari"));
+    }
+
+    #[test]
+    fn only_the_first_attempt_starts_from_scratch_and_runs_parallel() {
+        let opts = DownloadOpts::default();
+        let first = cmd_line("1080", &opts, true, FIRST_ATTEMPT);
+        assert!(!first.contains("--continue"), "{first}");
+        assert!(first.contains("--concurrent-fragments 8"), "{first}");
+        for kind in [Failure::Rejected, Failure::Flaky] {
+            let line = cmd_line("1080", &opts, true, next_retry(FIRST_ATTEMPT, kind));
+            assert!(line.contains("--continue"), "{kind:?}: {line}");
+            assert!(line.contains("--concurrent-fragments 1"), "{kind:?}: {line}");
+        }
     }
 
     #[test]
     fn a_mid_transfer_rejection_is_worth_another_run() {
-        assert!(is_transient_failure(
-            "error: unable to download video data: http error 403: forbidden"
-        ));
+        assert_eq!(
+            failure_kind("error: unable to download video data: http error 403: forbidden"),
+            Some(Failure::Rejected)
+        );
+        assert_eq!(
+            failure_kind("error: unable to download data: http error 503"),
+            Some(Failure::Flaky)
+        );
         // A missing format or a login wall will not go away on a retry.
-        assert!(!is_transient_failure("error: requested format is not available"));
-        assert!(!is_transient_failure("error: sign in to confirm your age"));
+        assert_eq!(failure_kind("error: requested format is not available"), None);
+        assert_eq!(failure_kind("error: sign in to confirm your age"), None);
     }
 
     #[test]
