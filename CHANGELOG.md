@@ -5,6 +5,58 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-04
+
+### Added
+
+- **A download queue.** Links can be lined up with **➕ Add to queue** and are
+  then worked off one after another, each with its own state in the list.
+  Entries can be added while the queue is already running, removed before
+  their turn comes, and cleared once they are done. **Stop** stops the whole
+  list rather than just the transfer in flight, and the entry it interrupted
+  goes back to waiting so a second **Start** picks up where it left off. With
+  nothing queued the tab behaves exactly as before — the list only appears
+  once there is something in it.
+- **Playlists.** `--no-playlist` used to be wired in, so a playlist or channel
+  URL only ever produced its first video. **Download the whole playlist** now
+  fetches every entry into a folder named after the list, optionally narrowed
+  to a range such as `1-10` or `3,5,7`. The up-front filename probe is skipped
+  in this mode, because "the" target name only ever described the first entry.
+- **A speed limit** in the advanced options, for a download that should not
+  take the whole line.
+- **Trim in the Convert tab.** Two timestamps ("1:30" or plain seconds) cut the
+  section to convert out of the source. Both bounds are passed as input
+  options, so the end stays a position in the *source* rather than an offset
+  into the trimmed result, and progress counts against the section instead of
+  the whole file. A trimmed file drops the source's chapter marks, which
+  describe a timeline it no longer has.
+- **A source summary in the Convert tab.** Choosing an input reads its length,
+  resolution, frame rate, codecs and size with ffprobe — the tool that was
+  already being asked for the pixel format. In custom-bitrate mode the summary
+  also estimates how large the result will be.
+- **A History tab.** Every finished download and conversion is recorded with
+  its file, the URL it came from and the preset it ran with. Entries open the
+  file or its folder, copy the path or the link, or load the URL straight back
+  into the Download tab. The list is filterable, capped at 200 entries and
+  stored in the same config file as everything else.
+- **A light theme**, switchable from the ☀/🌙 button in the header or from
+  **Appearance** in the Setup tab. The log colours have a second palette so
+  they stay readable on a pale background.
+- **Keyboard shortcuts**: `Ctrl`+`1`..`5` switch tabs, `Ctrl`+`Enter` starts
+  the visible tab, `Esc` stops what is running. A dialog on screen owns the
+  keyboard, so `Esc` there still just closes it.
+- **Copy** and **Save** buttons above both live logs.
+
+### Changed
+
+- The window title carries the running job's progress, so a minimised window
+  still says how far along it is.
+- The tab list shows a mark next to a tab whose job is still running.
+- The file a download produced is read off yt-dlp's own destination, merge and
+  move lines, which is what makes "open this file" in the history possible.
+- Spacing, corner rounding and the accent colour were pulled into one place so
+  both themes are laid out identically.
+
 ## [0.1.5] - 2026-08-19
 
 ### Changed

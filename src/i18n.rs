@@ -834,6 +834,181 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Erreur : plantage interne du processus de conversion",
         ),
 
+        // ---------------- 0.2.0: shared ----------------
+        "common.copy" => ("Copy", "Kopieren", "Copier"),
+        "common.save" => ("Save", "Speichern", "Enregistrer"),
+        "common.remove" => ("Remove", "Entfernen", "Retirer"),
+        "common.open_file" => ("Open file", "Datei öffnen", "Ouvrir le fichier"),
+        "common.open_folder" => ("Open folder", "Ordner öffnen", "Ouvrir le dossier"),
+        "common.log_copied" => ("Log copied to the clipboard", "Log in die Zwischenablage kopiert", "Journal copié dans le presse-papiers"),
+        "common.log_saved" => ("Log saved as {}", "Log gespeichert als {}", "Journal enregistré sous {}"),
+        "common.log_save_failed" => ("Could not save the log: {}", "Log konnte nicht gespeichert werden: {}", "Impossible d'enregistrer le journal : {}"),
+        "common.log_empty" => ("The log is empty", "Das Log ist leer", "Le journal est vide"),
+        "common.shortcuts" => (
+            "Ctrl+1..5 switch tabs · Ctrl+Enter starts · Esc stops",
+            "Strg+1..5 wechselt Tabs · Strg+Enter startet · Esc stoppt",
+            "Ctrl+1..5 change d'onglet · Ctrl+Entrée démarre · Échap arrête",
+        ),
+
+        // ---------------- 0.2.0: theme ----------------
+        "setup.appearance" => ("Appearance", "Darstellung", "Apparence"),
+        "theme.dark" => ("Dark", "Dunkel", "Sombre"),
+        "theme.light" => ("Light", "Hell", "Clair"),
+        "theme.toggle" => (
+            "Switch between the dark and the light theme",
+            "Zwischen dunklem und hellem Design wechseln",
+            "Basculer entre le thème sombre et le thème clair",
+        ),
+
+        // ---------------- 0.2.0: download queue ----------------
+        "dl.add_queue" => ("➕ Add to queue", "➕ Zur Liste", "➕ Ajouter à la file"),
+        "dl.add_queue_hint" => (
+            "Queue this URL and clear the field, so the next one can be pasted right away.",
+            "Diese URL vormerken und das Feld leeren, damit die nächste sofort eingefügt werden kann.",
+            "Mettre cette URL en file et vider le champ pour pouvoir coller la suivante.",
+        ),
+        "dl.queue_title" => ("Queue", "Warteschlange", "File d'attente"),
+        "dl.queue_empty" => (
+            "Nothing queued - Start simply downloads the URL above.",
+            "Nichts vorgemerkt - Start lädt einfach die URL oben.",
+            "File vide - Démarrer télécharge simplement l'URL ci-dessus.",
+        ),
+        "dl.queue_clear" => ("Clear queue", "Liste leeren", "Vider la file"),
+        "dl.queue_clear_done" => ("Remove finished", "Fertige entfernen", "Retirer les terminés"),
+        "dl.queue_added" => ("Queued - {} waiting", "Vorgemerkt - {} warten", "En file - {} en attente"),
+        "dl.queue_dupe" => (
+            "That URL is already in the queue",
+            "Diese URL steht schon in der Liste",
+            "Cette URL est déjà dans la file",
+        ),
+        "dl.start_queue" => ("▶ Start queue ({})", "▶ Liste starten ({})", "▶ Lancer la file ({})"),
+        "dl.queue_running" => ("Queue: {} of {}", "Liste: {} von {}", "File : {} sur {}"),
+        "dl.queue_done" => (
+            "Queue finished - {} done, {} failed",
+            "Liste fertig - {} erledigt, {} fehlgeschlagen",
+            "File terminée - {} réussis, {} échoués",
+        ),
+        "qs.pending" => ("waiting", "wartet", "en attente"),
+        "qs.running" => ("running", "läuft", "en cours"),
+        "qs.done" => ("done", "fertig", "terminé"),
+        "qs.failed" => ("failed", "fehlgeschlagen", "échoué"),
+        "qs.skipped" => ("skipped", "übersprungen", "ignoré"),
+
+        // ---------------- 0.2.0: playlists and rate limit ----------------
+        "dl.playlist" => ("Download the whole playlist", "Ganze Playlist laden", "Télécharger toute la playlist"),
+        "dl.playlist_hint" => (
+            "Every entry of a playlist or channel URL, saved into a folder named after the list.",
+            "Alle Einträge einer Playlist- oder Kanal-URL, gespeichert in einem Ordner mit dem Namen der Liste.",
+            "Toutes les entrées d'une playlist ou d'une chaîne, dans un dossier portant le nom de la liste.",
+        ),
+        "dl.playlist_items" => ("Items", "Einträge", "Éléments"),
+        "dl.playlist_items_hint" => ("e.g. 1-10 or 3,5,7", "z. B. 1-10 oder 3,5,7", "p. ex. 1-10 ou 3,5,7"),
+        "dl.rate_limit" => ("Speed limit", "Tempolimit", "Limite de débit"),
+        "dl.rate_limit_hint" => (
+            "e.g. 2M - empty for full speed",
+            "z. B. 2M - leer für volles Tempo",
+            "p. ex. 2M - vide pour la vitesse maximale",
+        ),
+        "toast.bad_rate" => (
+            "The speed limit has to look like 2M or 500K.",
+            "Das Tempolimit muss wie 2M oder 500K aussehen.",
+            "La limite de débit doit ressembler à 2M ou 500K.",
+        ),
+        "dlw.playlist_mode" => (
+            "Playlist mode: every entry is saved into a folder of its own.",
+            "Playlist-Modus: Jeder Eintrag wird in einen eigenen Ordner gespeichert.",
+            "Mode playlist : chaque entrée est enregistrée dans son propre dossier.",
+        ),
+
+        // ---------------- 0.2.0: convert trim and media info ----------------
+        "cv.trim" => ("Trim", "Zuschneiden", "Découper"),
+        "cv.trim_start" => ("From", "Von", "De"),
+        "cv.trim_end" => ("To", "Bis", "À"),
+        "cv.trim_hint" => (
+            "1:30 or 90 - leave both empty to convert the whole file",
+            "1:30 oder 90 - beide leer lassen für die ganze Datei",
+            "1:30 ou 90 - laissez les deux vides pour tout le fichier",
+        ),
+        "cv.trim_bad" => (
+            "Use timestamps like 1:30 or 0:01:30, and let the end come after the start.",
+            "Zeitangaben wie 1:30 oder 0:01:30 verwenden - das Ende muss nach dem Anfang liegen.",
+            "Utilisez des horodatages comme 1:30 ou 0:01:30, la fin devant suivre le début.",
+        ),
+        "cv.trim_end_of_file" => ("the end", "Ende", "la fin"),
+        "cv.trim_active" => ("Keeps {} of the source", "Behält {} der Quelle", "Conserve {} de la source"),
+        "cv.info" => ("Source file", "Quelldatei", "Fichier source"),
+        "cv.info_probing" => ("Reading the file ...", "Datei wird gelesen ...", "Lecture du fichier ..."),
+        "cv.info_none" => (
+            "FFprobe found no media streams in this file.",
+            "FFprobe hat in dieser Datei keine Medienspuren gefunden.",
+            "FFprobe n'a trouvé aucun flux média dans ce fichier.",
+        ),
+        "cv.info_length" => ("Length", "Länge", "Durée"),
+        "cv.info_video" => ("Video", "Video", "Vidéo"),
+        "cv.info_audio" => ("Audio", "Audio", "Audio"),
+        "cv.info_size" => ("Size", "Größe", "Taille"),
+        "cv.estimate" => ("Estimated result: about {}", "Geschätztes Ergebnis: etwa {}", "Résultat estimé : environ {}"),
+        "cv.open_output" => ("Open output folder", "Zielordner öffnen", "Ouvrir le dossier de sortie"),
+        "cvw.trim" => ("Section: {} to {}", "Abschnitt: {} bis {}", "Section : {} à {}"),
+
+        // ---------------- 0.2.0: history ----------------
+        "nav.history" => ("History", "Verlauf", "Historique"),
+        "hist.subtitle" => (
+            "Everything this app finished, newest first",
+            "Alles, was diese App abgeschlossen hat - das Neueste zuerst",
+            "Tout ce que l'application a terminé, du plus récent au plus ancien",
+        ),
+        "hist.empty" => (
+            "Nothing here yet - finished downloads and conversions land in this list.",
+            "Noch nichts da - abgeschlossene Downloads und Konvertierungen landen in dieser Liste.",
+            "Rien pour l'instant - les téléchargements et conversions terminés arrivent dans cette liste.",
+        ),
+        "hist.clear" => ("Clear history", "Verlauf leeren", "Effacer l'historique"),
+        "hist.missing" => ("file no longer there", "Datei nicht mehr vorhanden", "fichier introuvable"),
+        "hist.copy_path" => ("Copy path", "Pfad kopieren", "Copier le chemin"),
+        "hist.copy_url" => ("Copy URL", "URL kopieren", "Copier l'URL"),
+        "hist.reuse" => ("Load URL", "URL laden", "Charger l'URL"),
+        "hist.reused" => (
+            "URL loaded into the Download tab",
+            "URL in den Download-Tab übernommen",
+            "URL chargée dans l'onglet Téléchargement",
+        ),
+        "hist.copied" => ("Copied to the clipboard", "In die Zwischenablage kopiert", "Copié dans le presse-papiers"),
+        "hist.count" => ("{} of {} entries", "{} von {} Einträgen", "{} entrées sur {}"),
+        "when.now" => ("just now", "gerade eben", "maintenant"),
+        "when.minutes" => ("{} min ago", "vor {} Min.", "il y a {} min"),
+        "when.hours" => ("{} h ago", "vor {} Std.", "il y a {} h"),
+        "when.days" => ("{} d ago", "vor {} Tagen", "il y a {} j"),
+        "histf.all" => ("All", "Alle", "Tout"),
+        "histf.download" => ("Downloads", "Downloads", "Téléchargements"),
+        "histf.convert" => ("Conversions", "Konvertierungen", "Conversions"),
+
+        // ---------------- 0.2.0: info tab additions ----------------
+        "info.f_queue" => ("Queue", "Warteschlange", "File d'attente"),
+        "info.f_queue_d" => (
+            "line up as many links as you like and let them run one after another",
+            "beliebig viele Links vormerken und nacheinander abarbeiten lassen",
+            "mettez autant de liens que vous voulez en file et laissez-les s'enchaîner",
+        ),
+        "info.f_playlist" => ("Playlists", "Playlists", "Playlists"),
+        "info.f_playlist_d" => (
+            "whole playlists or channels, optionally only a range of them",
+            "ganze Playlists oder Kanäle, auf Wunsch nur ein Ausschnitt",
+            "playlists ou chaînes entières, éventuellement une plage seulement",
+        ),
+        "info.f_trim" => ("Trim", "Zuschneiden", "Découpe"),
+        "info.f_trim_d" => (
+            "convert only the section between two timestamps",
+            "nur den Abschnitt zwischen zwei Zeitmarken konvertieren",
+            "convertir uniquement la section entre deux horodatages",
+        ),
+        "info.f_history" => ("History", "Verlauf", "Historique"),
+        "info.f_history_d" => (
+            "find every finished file again, open it or reuse its link",
+            "jede fertige Datei wiederfinden, öffnen oder ihren Link erneut nutzen",
+            "retrouvez chaque fichier terminé, ouvrez-le ou réutilisez son lien",
+        ),
+
         // Unknown key: surface it rather than rendering nothing.
         _ => (key, key, key),
     }
@@ -883,6 +1058,8 @@ mod tests {
             consts::HW_OPTIONS,
             consts::BITRATE_MODE_OPTIONS,
             consts::CHANNEL_OPTIONS,
+            consts::THEME_OPTIONS,
+            consts::HISTORY_FILTER_OPTIONS,
         ];
         for (category, _) in consts::CATEGORY_OPTIONS {
             tables.push(consts::codec_options(category));

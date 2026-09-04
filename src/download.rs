@@ -15,7 +15,7 @@ use crate::binaries::{no_window, Binaries};
 use crate::consts::{ANON_NAME_HOSTS, IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX};
 use crate::emit::Emitter;
 use crate::i18n::{t, tf, Lang};
-use crate::types::{ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg};
+use crate::types::{ConflictDecision, ConflictReq, DownloadOpts, Outcome, Task, UiMsg};
 use crate::util;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -201,12 +201,21 @@ pub fn build_download_cmd(
         // Escaping only doubles '%', so joining the pattern on afterwards is
         // still a plain path join.
         let mut tmpl = PathBuf::from(util::escape_outtmpl(&Path::new(out_dir).to_string_lossy()));
-        tmpl.push("%(title).200B.%(ext)s");
+        if opts.playlist {
+            // A playlist drops dozens of files into the folder, so it gets one
+            // of its own. The comma chain picks the first field the extractor
+            // actually filled; the default keeps the path from collapsing when
+            // it filled none.
+            tmpl.push("%(playlist_title,playlist_id,uploader|Playlist)s");
+            tmpl.push("%(playlist_index)s - %(title).150B.%(ext)s");
+        } else {
+            tmpl.push("%(title).200B.%(ext)s");
+        }
         tmpl.to_string_lossy().to_string()
     };
     let mut base: Vec<String> = vec![
         "--newline".into(),
-        "--no-playlist".into(),
+        if opts.playlist { "--yes-playlist".into() } else { "--no-playlist".into() },
         "--retries".into(),
         "10".into(),
         "--fragment-retries".into(),
@@ -225,6 +234,14 @@ pub fn build_download_cmd(
         "-o".into(),
         outtmpl.map(|s| s.to_string()).unwrap_or(default_tmpl),
     ];
+    if opts.playlist && !opts.playlist_items.trim().is_empty() {
+        base.push("--playlist-items".into());
+        base.push(opts.playlist_items.trim().to_string());
+    }
+    if !opts.rate_limit.trim().is_empty() {
+        base.push("--limit-rate".into());
+        base.push(opts.rate_limit.trim().to_string());
+    }
     if force_overwrite {
         base.push("--force-overwrites".into());
         // --force-overwrites implies --no-continue. On a retry the half-written
@@ -577,6 +594,32 @@ struct RunOutcome {
     skipped_existing: bool,
     /// Everything the run printed on either stream, lowercased.
     logs: String,
+    /// The file the run says it wrote, when one of its lines named it.
+    produced: Option<PathBuf>,
+}
+
+/// Pulls the file yt-dlp says it wrote out of one of its own log lines.
+///
+/// yt-dlp announces every destination it opens, so the *last* line of a run
+/// that names one is the file the user ends up with: the per-stream downloads
+/// come first, the merge or the audio extraction that replaces them last.
+pub fn output_path_from_line(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix('[')?;
+    let (_tag, after) = rest.split_once("] ")?;
+    let unquote = |s: &str| s.trim().trim_matches('"').trim().to_string();
+    let candidate = if let Some(p) = after.strip_prefix("Destination: ") {
+        unquote(p)
+    } else if let Some(p) = after.strip_prefix("Merging formats into ") {
+        unquote(p)
+    } else if let Some(p) = after.strip_prefix("Moving file ") {
+        // "Moving file \"from\" to \"to\"" - only the destination matters.
+        unquote(p.rsplit_once(" to ")?.1)
+    } else if let Some(p) = after.strip_suffix(" has already been downloaded") {
+        unquote(p)
+    } else {
+        return None;
+    };
+    (!candidate.is_empty()).then_some(candidate)
 }
 
 /// Runs yt-dlp once, feeding progress and log lines to the UI.
@@ -621,6 +664,7 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     let generic_re = Regex::new(r"(\d+(?:\.\d+)?)%").unwrap();
     let mut last_progress = String::new();
     let mut skipped_existing = false;
+    let mut produced: Option<PathBuf> = None;
 
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         let line = line.trim().to_string();
@@ -637,6 +681,11 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
         }
         if line.to_lowercase().contains("has already been downloaded") {
             skipped_existing = true;
+        }
+        if !is_progress {
+            if let Some(p) = output_path_from_line(&line) {
+                produced = Some(PathBuf::from(p));
+            }
         }
 
         if is_progress {
@@ -676,6 +725,7 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
         code,
         skipped_existing,
         logs,
+        produced,
     })
 }
 
@@ -735,6 +785,13 @@ fn run_download_inner(
             ctx.em.log(Task::Download, ctx.tf("dlw.anon_name", &[stem]));
             (Some(tmpl.clone()), false, false)
         }
+        // A playlist writes many files, so probing for "the" target name would
+        // only ever describe its first entry. yt-dlp's own per-file handling
+        // takes over instead.
+        None if opts.playlist => {
+            ctx.em.log(Task::Download, ctx.t("dlw.playlist_mode"));
+            (None, opts.conflict == "overwrite", false)
+        }
         None => resolve_conflict(ctx, url, out_dir, quality, cookies, opts),
     };
     if cancelled {
@@ -743,10 +800,12 @@ fn run_download_inner(
         if stopped {
             ctx.em.status(Task::Download, ctx.t("status.cancelled"));
             ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
+            ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Cancelled));
         } else {
             ctx.em.status(Task::Download, ctx.t("dlw.skipped_status"));
             ctx.em.log(Task::Download, ctx.t("dlw.skipped_log"));
             ctx.em.toast(ctx.t("dlw.skipped_toast"), true);
+            ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Skipped));
         }
         return;
     }
@@ -756,7 +815,7 @@ fn run_download_inner(
     // instead of being reported as a dead end.
     let mut attempt = 0usize;
     let mut retry = FIRST_ATTEMPT;
-    let (code, skipped_existing, joined) = loop {
+    let (code, skipped_existing, joined, produced) = loop {
         let cmd = build_download_cmd(
             &ctx.bin,
             url,
@@ -778,7 +837,7 @@ fn run_download_inner(
         let spent = attempt + 1 >= MAX_ATTEMPTS || ctx.cancel.load(Ordering::SeqCst);
         let next = failure_kind(&run.logs).filter(|_| run.code != 0 && !spent);
         let Some(kind) = next else {
-            break (run.code, run.skipped_existing, run.logs);
+            break (run.code, run.skipped_existing, run.logs, run.produced);
         };
         attempt += 1;
         retry = next_retry(retry, kind);
@@ -796,25 +855,41 @@ fn run_download_inner(
         );
         ctx.em.status(Task::Download, ctx.t("dlw.retry_status"));
         if !sleep_cancellable(ctx, RETRY_PAUSE) {
-            break (run.code, run.skipped_existing, run.logs);
+            break (run.code, run.skipped_existing, run.logs, run.produced);
         }
     };
+
+    // A renamed target is the file we asked for; the log line only confirms
+    // it. When neither is known the outcome simply carries no path.
+    let produced = produced.or_else(|| {
+        outtmpl
+            .as_deref()
+            // `outtmpl_for` doubled every '%' for the template language;
+            // stripping the extension field and halving them back gives the
+            // literal path again.
+            .map(|t| PathBuf::from(t.replace(".%(ext)s", "").replace("%%", "%")))
+            .filter(|p| p.exists())
+    });
 
     let cancelled = ctx.cancel.load(Ordering::SeqCst);
     if cancelled {
         ctx.em.status(Task::Download, ctx.t("status.cancelled"));
         ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
+        ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Cancelled));
     } else if code == 0 && skipped_existing {
         ctx.em.progress(Task::Download, -1.0);
         ctx.em.status(Task::Download, ctx.t("dlw.nothing_status"));
         ctx.em.log(Task::Download, ctx.t("dlw.nothing_log"));
         ctx.em.log(Task::Download, ctx.t("dlw.nothing_tip"));
         ctx.em.toast(ctx.t("dlw.nothing_status"), true);
+        ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Skipped));
     } else if code == 0 {
         ctx.em.progress(Task::Download, 1.0);
         ctx.em.status(Task::Download, ctx.t("dlw.completed"));
         ctx.em.log(Task::Download, ctx.t("dlw.success_log"));
         ctx.em.toast(ctx.t("dlw.success_toast"), false);
+        ctx.em
+            .send(UiMsg::Finished(Task::Download, Outcome::Success(produced)));
     } else {
         ctx.em.status(Task::Download, ctx.t("dlw.failed"));
         ctx.em.log(
@@ -837,6 +912,7 @@ fn run_download_inner(
             ctx.em.log(Task::Download, ctx.t("dlw.tip_nojs"));
         }
         ctx.em.toast(ctx.t("dlw.failed"), true);
+        ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Failed));
     }
 }
 
@@ -937,6 +1013,56 @@ mod tests {
         // A missing format or a login wall will not go away on a retry.
         assert_eq!(failure_kind("error: requested format is not available"), None);
         assert_eq!(failure_kind("error: sign in to confirm your age"), None);
+    }
+
+    #[test]
+    fn the_file_yt_dlp_wrote_is_read_off_its_own_log_lines() {
+        assert_eq!(
+            output_path_from_line("[download] Destination: C:/v/clip.f137.mp4"),
+            Some("C:/v/clip.f137.mp4".to_string())
+        );
+        assert_eq!(
+            output_path_from_line("[Merger] Merging formats into \"C:/v/clip.mp4\""),
+            Some("C:/v/clip.mp4".to_string())
+        );
+        assert_eq!(
+            output_path_from_line("[MoveFiles] Moving file \"tmp/a.mp4\" to \"out/a.mp4\""),
+            Some("out/a.mp4".to_string())
+        );
+        assert_eq!(
+            output_path_from_line("[download] out/a.mp4 has already been downloaded"),
+            Some("out/a.mp4".to_string())
+        );
+        // Progress and ordinary chatter name no file.
+        assert_eq!(output_path_from_line("[youtube] Extracting URL: https://x"), None);
+        assert_eq!(output_path_from_line("download:  12.0%|1.2MiB/s|00:10"), None);
+    }
+
+    #[test]
+    fn a_playlist_run_asks_for_the_whole_list_in_its_own_folder() {
+        let opts = DownloadOpts {
+            playlist: true,
+            playlist_items: "1-5".into(),
+            ..Default::default()
+        };
+        let line = cmd_line("1080", &opts, false, Retry::default());
+        assert!(line.contains("--yes-playlist"), "{line}");
+        assert!(!line.contains("--no-playlist"), "{line}");
+        assert!(line.contains("--playlist-items 1-5"), "{line}");
+        assert!(line.contains("%(playlist_index)s"), "{line}");
+        // A single video keeps the flat name it always had.
+        let single = cmd_line("1080", &DownloadOpts::default(), false, Retry::default());
+        assert!(single.contains("--no-playlist"), "{single}");
+        assert!(!single.contains("%(playlist_index)s"), "{single}");
+        assert!(!single.contains("--playlist-items"), "{single}");
+    }
+
+    #[test]
+    fn a_speed_limit_is_only_passed_when_one_was_typed() {
+        let opts = DownloadOpts { rate_limit: "2M".into(), ..Default::default() };
+        assert!(cmd_line("1080", &opts, false, Retry::default()).contains("--limit-rate 2M"));
+        let line = cmd_line("1080", &DownloadOpts::default(), false, Retry::default());
+        assert!(!line.contains("--limit-rate"), "{line}");
     }
 
     #[test]

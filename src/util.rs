@@ -58,6 +58,53 @@ pub fn format_elapsed(seconds: f64) -> String {
     format!("{}:{:02}:{:02}.{:02}", hh, mm, ss, frac)
 }
 
+/// Renders a number of seconds as "H:MM:SS".
+pub fn format_clock(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as i64;
+    let (hh, rem) = (total / 3600, total % 3600);
+    format!("{}:{:02}:{:02}", hh, rem / 60, rem % 60)
+}
+
+/// Reads a user-typed timestamp: "90", "1:30", "1:02:03", all with an
+/// optional fraction. `None` means "nothing usable was typed", which every
+/// caller treats as "no bound", so a half-finished entry never silently
+/// becomes a cut at second zero.
+pub fn parse_time_input(text: &str) -> Option<f64> {
+    let text = text.trim().replace(',', ".");
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0.0;
+    let parts: Vec<&str> = text.split(':').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+    for part in &parts {
+        let value: f64 = part.trim().parse().ok()?;
+        if value < 0.0 {
+            return None;
+        }
+        total = total * 60.0 + value;
+    }
+    Some(total)
+}
+
+/// Byte count in the largest unit that keeps it readable.
+pub fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Parses an ffmpeg-style speed value ("1.23x") into a float.
 pub fn parse_speed_value(speed_text: &str) -> Option<f64> {
     if speed_text.is_empty() {
@@ -346,6 +393,31 @@ mod tests {
         // Every draw maps onto 1..=3, so the scan has to find the first gap.
         let stem = free_anon_stem(&taken, [0, 1, 2].into_iter());
         assert_eq!(stem, "video-4");
+    }
+
+    #[test]
+    fn typed_timestamps_are_read_in_every_shape_the_field_allows() {
+        assert_eq!(parse_time_input("90"), Some(90.0));
+        assert_eq!(parse_time_input("1:30"), Some(90.0));
+        assert_eq!(parse_time_input("1:02:03"), Some(3723.0));
+        assert_eq!(parse_time_input(" 0:00:01.5 "), Some(1.5));
+        assert_eq!(parse_time_input("0:00:01,5"), Some(1.5));
+        // Nothing usable - the caller must not read this as "second zero".
+        assert_eq!(parse_time_input(""), None);
+        assert_eq!(parse_time_input("   "), None);
+        assert_eq!(parse_time_input("abc"), None);
+        assert_eq!(parse_time_input("1:2:3:4"), None);
+        assert_eq!(parse_time_input("-5"), None);
+    }
+
+    #[test]
+    fn clock_and_byte_formatting_stay_readable() {
+        assert_eq!(format_clock(0.0), "0:00:00");
+        assert_eq!(format_clock(3723.4), "1:02:03");
+        assert_eq!(format_clock(-10.0), "0:00:00");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
     }
 
     #[test]

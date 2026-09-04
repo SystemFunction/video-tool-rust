@@ -3,7 +3,7 @@
 //! Dropdown tables are `(value, i18n-key)` pairs - the second element is
 //! resolved through `crate::i18n` at draw time, never shown verbatim.
 
-pub const VERSION: &str = "0.1.5";
+pub const VERSION: &str = "0.2.0";
 pub const APP_NAME: &str = "Video Tool";
 
 /// First stable yt-dlp release with the reworked Instagram extractor.
@@ -114,3 +114,78 @@ pub const CHANNEL_OPTIONS: &[(&str, &str)] = &[
     ("nightly", "channel.nightly"),
     ("master", "channel.master"),
 ];
+
+pub const HISTORY_FILTER_OPTIONS: &[(&str, &str)] = &[
+    ("all", "histf.all"),
+    ("download", "histf.download"),
+    ("convert", "histf.convert"),
+];
+
+pub const THEME_OPTIONS: &[(&str, &str)] = &[
+    ("dark", "theme.dark"),
+    ("light", "theme.light"),
+];
+
+/// Most entries the history keeps. Old ones fall off the end.
+pub const HISTORY_LIMIT: usize = 200;
+
+/// Characters a `--playlist-items` range may consist of. Anything else is
+/// dropped rather than handed to yt-dlp, which would read it as a new option.
+pub const PLAYLIST_ITEMS_CHARS: &str = "0123456789,:-";
+
+/// Accepted shape of a `--limit-rate` value, e.g. "2M", "500K", "1.5M".
+pub fn is_rate_limit(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 12 {
+        return false;
+    }
+    let (num, unit) = match t.char_indices().find(|(_, c)| c.is_ascii_alphabetic()) {
+        Some((i, _)) => t.split_at(i),
+        None => (t, ""),
+    };
+    if !matches!(unit.to_ascii_lowercase().as_str(), "" | "k" | "m" | "g") {
+        return false;
+    }
+    num.parse::<f64>().map(|v| v > 0.0).unwrap_or(false)
+}
+
+/// Keeps only the characters a playlist range may contain.
+///
+/// The leading separators go too: a value starting with "-" would reach
+/// yt-dlp as an option rather than as the range it is meant to be.
+pub fn clean_playlist_items(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .filter(|c| PLAYLIST_ITEMS_CHARS.contains(*c))
+        .collect();
+    kept.trim_start_matches([',', ':', '-']).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_real_rate_reaches_yt_dlp() {
+        for good in ["2M", "500K", "1.5M", "800", "3g"] {
+            assert!(is_rate_limit(good), "{good}");
+        }
+        // Anything else would arrive as a bare argument and be read as an
+        // option or a URL.
+        for bad in ["", "  ", "fast", "-1M", "0", "2MB", "--rm -rf", "2 M"] {
+            assert!(!is_rate_limit(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_playlist_range_keeps_only_range_characters() {
+        assert_eq!(clean_playlist_items("1-10"), "1-10");
+        assert_eq!(clean_playlist_items("3,5,7"), "3,5,7");
+        assert_eq!(clean_playlist_items("1:3:2"), "1:3:2");
+        assert_eq!(clean_playlist_items(" 1 - 10 "), "1-10");
+        assert_eq!(clean_playlist_items("1;rm -rf /"), "1-");
+        // A value that would arrive as an option instead of a range.
+        assert_eq!(clean_playlist_items("-f bestvideo"), "");
+        assert_eq!(clean_playlist_items(",,2-4"), "2-4");
+    }
+}

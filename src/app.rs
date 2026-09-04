@@ -16,14 +16,29 @@ use crate::consts::*;
 use crate::convert::{self, ConvertParams, CvCtx};
 use crate::download::{self, DlCtx};
 use crate::emit::Emitter;
+use crate::history;
 use crate::i18n::{self, Lang};
 use crate::types::{
-    BinaryStatus, CheckKind, ConflictDecision, ConflictReq, DownloadOpts, Task, UiMsg,
+    BinaryStatus, CheckKind, ConflictDecision, ConflictReq, DownloadOpts, MediaInfo, Outcome,
+    QueueState, Task, UiMsg,
 };
 use crate::update::{self, Release};
 use crate::util;
 
 const MAX_LOG: usize = 1200;
+
+/// Tab indices, so the nav, the keyboard shortcuts and the router agree.
+const TAB_DOWNLOAD: usize = 0;
+const TAB_CONVERT: usize = 1;
+const TAB_HISTORY: usize = 2;
+const TAB_SETUP: usize = 3;
+const TAB_INFO: usize = 4;
+
+/// One queued download, waiting for its turn or already past it.
+struct QueueItem {
+    url: String,
+    state: QueueState,
+}
 
 /// Config key holding the last binary probe, see `probe_cache_load`.
 const PROBE_CACHE_KEY: &str = "binary_probe_cache";
@@ -49,6 +64,11 @@ pub struct App {
     setup_log: String,
     setup_busy: bool,
     channel: String,
+    /// "dark" or "light"; anything else is read as dark.
+    theme: String,
+    /// Last title pushed to the window manager, so an unchanged one is not
+    /// resent on every frame while a job runs.
+    title: String,
 
     // download state
     dl_url: String,
@@ -64,7 +84,23 @@ pub struct App {
     dl_subs_lang: String,
     dl_potoken: bool,
     dl_potoken_url: String,
+    dl_playlist: bool,
+    dl_playlist_items: String,
+    dl_rate_limit: String,
     dl_advanced: bool,
+    /// URLs lined up for download, oldest first.
+    dl_queue: Vec<QueueItem>,
+    /// True while the queue is being worked through; Stop clears it so the
+    /// remaining entries stay put instead of starting on their own.
+    dl_queue_running: bool,
+    /// Index of the entry the running worker belongs to.
+    dl_current: Option<usize>,
+    /// URL and preset of that run, kept for the history entry it becomes.
+    dl_current_url: String,
+    dl_current_quality: String,
+    /// Outcome the worker reported; `Failed` until it says otherwise, so a
+    /// worker that dies without a word is not counted as a success.
+    dl_last_outcome: Outcome,
     dl_log: Vec<String>,
     dl_status: String,
     dl_progress: Option<f32>,
@@ -82,6 +118,18 @@ pub struct App {
     cv_crf: f32,
     cv_custom_br: f32,
     cv_preserve_color: bool,
+    /// Typed trim bounds, kept as text so a half-finished entry is not read
+    /// as a cut. They only become numbers when the run starts.
+    cv_trim_start: String,
+    cv_trim_end: String,
+    /// What ffprobe said about the current input, once it answered.
+    cv_info: Option<MediaInfo>,
+    cv_info_probing: bool,
+    /// Input path the probe was started for - a late answer for a file the
+    /// user has since replaced is dropped rather than shown against it.
+    cv_info_for: String,
+    /// Output of the last finished conversion, for "open output folder".
+    cv_last_output: String,
     cv_log: Vec<String>,
     cv_status: String,
     cv_progress: Option<f32>,
@@ -93,6 +141,10 @@ pub struct App {
     pending_conflict: Option<ConflictReq>,
     conflict_name: String,
     conflict_error: Option<String>,
+
+    // history
+    history: Vec<history::Entry>,
+    hist_filter: String,
 
     // updates
     update_auto: bool,
@@ -118,10 +170,11 @@ enum UpdateUi {
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let ctx = cc.egui_ctx.clone();
-        ctx.set_visuals(egui::Visuals::dark());
 
         let bin = Arc::new(Binaries::new());
         let config = Config::load(&bin.app_dir);
+        let theme = config.get_str("theme", "dark");
+        apply_style(&ctx, &theme);
         let (tx, rx) = std::sync::mpsc::channel::<UiMsg>();
 
         let downloads = dirs::download_dir()
@@ -141,6 +194,8 @@ impl App {
             setup_log: String::new(),
             setup_busy: false,
             channel: config.get_str("ytdlp_channel", "stable"),
+            theme: theme.clone(),
+            title: String::new(),
 
             dl_url: String::new(),
             dl_output: config.get_str("last_output_folder", &downloads),
@@ -155,7 +210,16 @@ impl App {
             dl_subs_lang: config.get_str("subs_lang", "en,de"),
             dl_potoken: config.get_bool("potoken", false),
             dl_potoken_url: config.get_str("potoken_url", ""),
+            dl_playlist: config.get_bool("playlist", false),
+            dl_playlist_items: config.get_str("playlist_items", ""),
+            dl_rate_limit: config.get_str("rate_limit", ""),
             dl_advanced: false,
+            dl_queue: Vec::new(),
+            dl_queue_running: false,
+            dl_current: None,
+            dl_current_url: String::new(),
+            dl_current_quality: String::new(),
+            dl_last_outcome: Outcome::Failed,
             dl_log: vec![
                 format!("  {APP_NAME} v{VERSION}"),
                 format!("  {}", "-".repeat(36)),
@@ -177,6 +241,12 @@ impl App {
             cv_crf: 20.0,
             cv_custom_br: 20.0,
             cv_preserve_color: true,
+            cv_trim_start: String::new(),
+            cv_trim_end: String::new(),
+            cv_info: None,
+            cv_info_probing: false,
+            cv_info_for: String::new(),
+            cv_last_output: String::new(),
             cv_log: vec![i18n::t(lang, "log.ready_conversion").to_string()],
             cv_status: i18n::t(lang, "status.ready").to_string(),
             cv_progress: None,
@@ -187,6 +257,9 @@ impl App {
             pending_conflict: None,
             conflict_name: String::new(),
             conflict_error: None,
+
+            history: history::load(&config),
+            hist_filter: "all".into(),
 
             update_auto: config.get_bool("update_check", true),
             update_ui: UpdateUi::Idle,
@@ -327,6 +400,9 @@ impl App {
                         self.dl_busy = b;
                         if !b {
                             self.dl_progress = None;
+                            // Sent after the worker's `Finished`, so the
+                            // outcome it reported is already in hand.
+                            self.download_ended();
                         }
                     }
                     Task::Convert => {
@@ -336,6 +412,20 @@ impl App {
                         }
                     }
                 },
+                UiMsg::Finished(Task::Download, outcome) => self.dl_last_outcome = outcome,
+                UiMsg::Finished(Task::Convert, outcome) => self.convert_finished(outcome),
+                UiMsg::MediaInfo(info) => {
+                    let info = *info;
+                    // A probe the user has already moved on from answers for
+                    // the wrong file; only the current one is adopted.
+                    let current = self.cv_input.trim();
+                    if info.as_ref().map(|i| i.path.as_str()) == Some(current)
+                        || self.cv_info_for == current
+                    {
+                        self.cv_info_probing = false;
+                        self.cv_info = info;
+                    }
+                }
                 UiMsg::Toast(msg, error) => self.toasts.push(Toast {
                     msg,
                     error,
@@ -417,39 +507,156 @@ impl App {
 
     // ---------------- spawning workers ----------------
 
-    fn spawn_download(&mut self) {
+    /// The settings a run needs regardless of which URL is next.
+    fn download_settings_ok(&mut self) -> bool {
+        let out_dir = self.dl_output.trim().to_string();
+        if out_dir.is_empty() {
+            self.toast_key("toast.need_folder", true);
+            return false;
+        }
+        if !self.status.ytdlp_ok {
+            self.toast_key("toast.no_ytdlp", true);
+            return false;
+        }
+        if self.dl_cookies == "cookiefile" {
+            let file = self.dl_cookiefile.trim().to_string();
+            if file.is_empty() || !Path::new(&file).is_file() {
+                self.toast_key("toast.no_cookiefile", true);
+                return false;
+            }
+        }
+        // An unparseable limit would reach yt-dlp as a bare argument, so it is
+        // caught here rather than turning into a confusing extractor error.
+        if !self.dl_rate_limit.trim().is_empty() && !is_rate_limit(&self.dl_rate_limit) {
+            self.toast_key("toast.bad_rate", true);
+            return false;
+        }
+        if let Err(e) = std::fs::create_dir_all(&out_dir) {
+            let msg = self.tf("toast.mkdir_failed", &[&e.to_string()]);
+            self.toast(&msg, true);
+            return false;
+        }
+        true
+    }
+
+    /// Moves the typed URL into the queue; `false` means it was not usable.
+    fn enqueue_typed_url(&mut self) -> bool {
+        let url = self.dl_url.trim().to_string();
+        if url.is_empty() {
+            self.toast_key("toast.need_url", true);
+            return false;
+        }
+        if !is_http_url(&url) {
+            self.toast_key("toast.bad_url", true);
+            return false;
+        }
+        // Only waiting entries block a duplicate - queueing something again
+        // after it finished is a normal way to retry it.
+        if self
+            .dl_queue
+            .iter()
+            .any(|i| i.url == url && i.state == QueueState::Pending)
+        {
+            self.toast_key("dl.queue_dupe", true);
+            return false;
+        }
+        self.dl_queue.push(QueueItem {
+            url,
+            state: QueueState::Pending,
+        });
+        self.dl_url.clear();
+        true
+    }
+
+    /// Start: queue whatever is typed, then work the list off top to bottom.
+    fn start_downloads(&mut self) {
         if self.dl_busy {
             return;
         }
-        let url = self.dl_url.trim().to_string();
-        let out_dir = self.dl_output.trim().to_string();
-        if url.is_empty() {
+        if !self.dl_url.trim().is_empty() && !self.enqueue_typed_url() {
+            return;
+        }
+        if !self
+            .dl_queue
+            .iter()
+            .any(|i| i.state == QueueState::Pending)
+        {
             return self.toast_key("toast.need_url", true);
         }
-        if !(url.to_lowercase().starts_with("http://") || url.to_lowercase().starts_with("https://"))
-        {
-            return self.toast_key("toast.bad_url", true);
+        if !self.download_settings_ok() {
+            return;
         }
-        if out_dir.is_empty() {
-            return self.toast_key("toast.need_folder", true);
+        self.dl_queue_running = true;
+        self.dl_log.clear();
+        self.advance_queue();
+    }
+
+    /// Starts the next waiting entry, or closes the run out.
+    fn advance_queue(&mut self) {
+        if self.dl_busy || !self.dl_queue_running {
+            return;
         }
-        if !self.status.ytdlp_ok {
-            return self.toast_key("toast.no_ytdlp", true);
+        let Some(index) = self
+            .dl_queue
+            .iter()
+            .position(|i| i.state == QueueState::Pending)
+        else {
+            self.dl_queue_running = false;
+            let count = |s: QueueState| self.dl_queue.iter().filter(|i| i.state == s).count();
+            let (done, failed) = (count(QueueState::Done), count(QueueState::Failed));
+            // A single download already reports itself; only a real queue
+            // needs the summary on top of it.
+            if self.dl_queue.len() > 1 {
+                let msg = self.tf("dl.queue_done", &[&done.to_string(), &failed.to_string()]);
+                self.toast(&msg, failed > 0);
+            }
+            return;
+        };
+        self.dl_queue[index].state = QueueState::Running;
+        self.dl_current = Some(index);
+        let url = self.dl_queue[index].url.clone();
+        self.spawn_download(url);
+    }
+
+    /// Files the finished run away and lets the queue move on.
+    fn download_ended(&mut self) {
+        let Some(index) = self.dl_current.take() else {
+            return;
+        };
+        let outcome = std::mem::replace(&mut self.dl_last_outcome, Outcome::Failed);
+        let state = match &outcome {
+            Outcome::Success(_) => QueueState::Done,
+            Outcome::Skipped => QueueState::Skipped,
+            // Stop is not a failure - the entry goes back to waiting so a
+            // second Start picks up where this one left off.
+            Outcome::Cancelled => QueueState::Pending,
+            Outcome::Failed => QueueState::Failed,
+        };
+        if let Some(item) = self.dl_queue.get_mut(index) {
+            item.state = state;
         }
+        if let Outcome::Success(path) = &outcome {
+            let url = self.dl_current_url.clone();
+            let detail = label_of(self.lang, &self.dl_current_quality, QUALITY_OPTIONS);
+            self.remember(history::Kind::Download, path.as_deref(), &url, &detail);
+        }
+        if matches!(outcome, Outcome::Cancelled) {
+            self.dl_queue_running = false;
+            return;
+        }
+        self.advance_queue();
+    }
+
+    fn spawn_download(&mut self, url: String) {
+        if self.dl_busy {
+            return;
+        }
+        let out_dir = self.dl_output.trim().to_string();
         let cookiefile = if self.dl_cookies == "cookiefile" {
             self.dl_cookiefile.trim().to_string()
         } else {
             String::new()
         };
-        if self.dl_cookies == "cookiefile"
-            && (cookiefile.is_empty() || !Path::new(&cookiefile).is_file())
-        {
-            return self.toast_key("toast.no_cookiefile", true);
-        }
-        if let Err(e) = std::fs::create_dir_all(&out_dir) {
-            let msg = self.tf("toast.mkdir_failed", &[&e.to_string()]);
-            return self.toast(&msg, true);
-        }
 
         self.config.set_str("last_output_folder", &out_dir);
         self.config.set_str("last_url", &url);
@@ -479,10 +686,15 @@ impl App {
             potoken_url: self.dl_potoken_url.trim().to_string(),
             plugins_dir: self.bin.plugins_dir.to_string_lossy().to_string(),
             conflict: self.dl_conflict.clone(),
+            playlist: self.dl_playlist,
+            playlist_items: clean_playlist_items(&self.dl_playlist_items),
+            rate_limit: self.dl_rate_limit.trim().to_string(),
         };
         let quality = self.dl_quality.clone();
+        self.dl_current_url = url.clone();
+        self.dl_current_quality = quality.clone();
+        self.dl_last_outcome = Outcome::Failed;
 
-        self.dl_log.clear();
         self.dl_status = self.t("status.downloading").to_string();
         self.dl_progress = Some(0.0);
         self.dl_busy = true;
@@ -549,6 +761,10 @@ impl App {
             }
         }
 
+        let Some((trim_start, trim_end)) = self.trim_bounds() else {
+            return self.toast_key("cv.trim_bad", true);
+        };
+
         let params = ConvertParams {
             codec_key: self.cv_codec.clone(),
             hw_setting: self.cv_hw.clone(),
@@ -556,8 +772,11 @@ impl App {
             use_custom: self.cv_bitrate_mode == "custom",
             custom_br: self.cv_custom_br as i32,
             preserve_color: self.cv_preserve_color,
+            trim_start,
+            trim_end,
         };
 
+        self.cv_last_output.clear();
         self.cv_log.clear();
         self.cv_status = self.t("status.converting").to_string();
         self.cv_progress = Some(0.0);
@@ -580,11 +799,153 @@ impl App {
     }
 
     fn stop_download(&mut self) {
+        // The whole list stops, not just the entry in flight - "Stop" on a
+        // queue that immediately started the next URL would be no stop at all.
+        self.dl_queue_running = false;
         self.dl_cancel.store(true, Ordering::SeqCst);
         if let Some(c) = util::lock(&self.dl_child).as_mut() {
             let _ = c.kill();
         }
         self.dl_status = self.t("status.cancelled").to_string();
+    }
+
+    /// The typed trim bounds as seconds, or `None` when they make no sense.
+    ///
+    /// An empty field is "no bound"; a field with something unreadable in it
+    /// is an error, so a typo cannot quietly turn into a cut at second zero.
+    fn trim_bounds(&self) -> Option<(Option<f64>, Option<f64>)> {
+        let read = |text: &str| -> Option<Option<f64>> {
+            if text.trim().is_empty() {
+                Some(None)
+            } else {
+                util::parse_time_input(text).map(Some)
+            }
+        };
+        let start = read(&self.cv_trim_start)?;
+        let end = read(&self.cv_trim_end)?;
+        match (start, end) {
+            (Some(a), Some(b)) if b <= a => None,
+            (None, Some(b)) if b <= 0.0 => None,
+            _ => Some((start, end)),
+        }
+    }
+
+    /// Reads the Convert tab's input file in the background.
+    fn start_media_probe(&mut self) {
+        let file = self.cv_input.trim().to_string();
+        self.cv_info = None;
+        self.cv_info_for = file.clone();
+        if file.is_empty() || !Path::new(&file).is_file() || !self.status.ffmpeg_ok {
+            self.cv_info_probing = false;
+            return;
+        }
+        self.cv_info_probing = true;
+        let bin = self.bin.clone();
+        let em = self.emitter();
+        thread::spawn(move || {
+            let info = convert::probe_media_info(&bin, &file);
+            em.send(UiMsg::MediaInfo(Box::new(info)));
+        });
+    }
+
+    /// Adopts a finished conversion: its output and its history entry.
+    fn convert_finished(&mut self, outcome: Outcome) {
+        let Outcome::Success(Some(path)) = outcome else {
+            return;
+        };
+        self.cv_last_output = path.to_string_lossy().to_string();
+        let detail = label_of(self.lang, &self.cv_codec, codec_options(&self.cv_category));
+        self.remember(history::Kind::Convert, Some(path.as_path()), "", &detail);
+    }
+
+    /// Writes one finished job into the history and persists the list.
+    fn remember(
+        &mut self,
+        kind: history::Kind,
+        path: Option<&Path>,
+        url: &str,
+        detail: &str,
+    ) {
+        let name = path
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| url.to_string());
+        if name.is_empty() {
+            return;
+        }
+        history::push(
+            &mut self.history,
+            history::Entry {
+                kind,
+                name,
+                path: path.map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+                url: url.to_string(),
+                detail: detail.to_string(),
+                when: history::now_secs(),
+            },
+        );
+        history::store(&mut self.config, &self.history);
+    }
+
+    fn log_of(&self, task: Task) -> &[String] {
+        match task {
+            Task::Download => &self.dl_log,
+            Task::Convert => &self.cv_log,
+        }
+    }
+
+    fn copy_log(&mut self, task: Task) {
+        let text = self.log_of(task).join("\n");
+        if text.trim().is_empty() {
+            return self.toast_key("common.log_empty", true);
+        }
+        if copy_to_clipboard(&text) {
+            self.toast_key("common.log_copied", false);
+        }
+    }
+
+    fn save_log(&mut self, task: Task) {
+        // CRLF so the file opens readably in Notepad, which is where a log
+        // handed to someone else usually lands first.
+        let text = self.log_of(task).join("\r\n");
+        if text.trim().is_empty() {
+            return self.toast_key("common.log_empty", true);
+        }
+        let stem = match task {
+            Task::Download => "download",
+            Task::Convert => "convert",
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Text", &["txt"])
+            .set_file_name(format!("video-tool-{stem}.txt"))
+            .save_file()
+        else {
+            return;
+        };
+        match std::fs::write(&path, text) {
+            Ok(_) => {
+                let msg = self.tf("common.log_saved", &[&convert::file_name(&path)]);
+                self.toast(&msg, false);
+            }
+            Err(e) => {
+                let msg = self.tf("common.log_save_failed", &[&e.to_string()]);
+                self.toast(&msg, true);
+            }
+        }
+    }
+
+    fn set_theme(&mut self, theme: &str) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme.to_string();
+        self.config.set_str("theme", theme);
+        apply_style(&self.ctx, theme);
+    }
+
+    fn dark(&self) -> bool {
+        self.theme != "light"
     }
 
     fn stop_convert(&mut self) {
@@ -722,6 +1083,7 @@ impl App {
             ui.label(RichText::new(format!("v{VERSION}")).color(Color32::from_rgb(178, 235, 242)));
             ui.add_space(16.0);
             let mut picked: Option<Lang> = None;
+            let mut next_theme: Option<&str> = None;
             let lang = self.lang;
             with_available_right(ui, |ui| {
                 let (yt_ok, yt) = (self.status.ytdlp_ok, &self.status.ytdlp_version);
@@ -729,6 +1091,17 @@ impl App {
                 chip(ui, "FFmpeg", ff_ok, if ff_ok { ff } else { "x" });
                 chip(ui, "yt-dlp", yt_ok, if yt_ok { yt } else { "x" });
                 ui.add_space(8.0);
+                // The icon shows what a click switches to, not what is on.
+                let dark = self.theme != "light";
+                let icon = if dark { "☀" } else { "🌙" };
+                if ui
+                    .button(RichText::new(icon).size(15.0))
+                    .on_hover_text(i18n::t(lang, "theme.toggle"))
+                    .clicked()
+                {
+                    next_theme = Some(if dark { "light" } else { "dark" });
+                }
+                ui.add_space(4.0);
                 // Sits with the other global state, reachable from every tab.
                 egui::ComboBox::from_id_salt("lang")
                     .selected_text(format!("🌐 {}", lang.label()))
@@ -748,6 +1121,9 @@ impl App {
             });
             if let Some(l) = picked {
                 self.set_lang(l);
+            }
+            if let Some(theme) = next_theme {
+                self.set_theme(theme);
             }
         });
     }
@@ -800,17 +1176,39 @@ impl App {
         // Translated tab names are longer than the English ones - without this
         // "Konvertieren" and "Téléchargement" break across two lines.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        let items = ["nav.download", "nav.convert", "nav.setup", "nav.info"];
-        for (i, key) in items.iter().enumerate() {
+        let items = [
+            ("⬇", "nav.download"),
+            ("⚙", "nav.convert"),
+            ("🕘", "nav.history"),
+            ("🔧", "nav.setup"),
+            ("ℹ", "nav.info"),
+        ];
+        for (i, (icon, key)) in items.iter().enumerate() {
             let selected = self.tab == i;
-            if ui
-                .selectable_label(selected, RichText::new(self.t(key)).size(15.0))
-                .clicked()
-            {
+            // A running job is worth seeing from the other tabs too.
+            let busy = (i == TAB_DOWNLOAD && self.dl_busy) || (i == TAB_CONVERT && self.cv_busy);
+            let label = if busy {
+                format!("{icon}  {} ●", self.t(key))
+            } else {
+                format!("{icon}  {}", self.t(key))
+            };
+            let text = RichText::new(label).size(15.0);
+            let text = if busy { text.color(accent()) } else { text };
+            if ui.selectable_label(selected, text).clicked() {
                 self.tab = i;
             }
             ui.add_space(4.0);
         }
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(6.0);
+        // The hint is a sentence, not a tab name - it may wrap.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        ui.label(
+            RichText::new(self.t("common.shortcuts"))
+                .size(10.0)
+                .color(Color32::GRAY),
+        );
     }
 
     fn ui_download(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -839,6 +1237,20 @@ impl App {
                     if let Some(t) = clipboard_text() {
                         self.dl_url = t;
                     }
+                }
+                if ui
+                    .button(self.t("dl.add_queue"))
+                    .on_hover_text(self.t("dl.add_queue_hint"))
+                    .clicked()
+                    && self.enqueue_typed_url()
+                {
+                    let waiting = self
+                        .dl_queue
+                        .iter()
+                        .filter(|i| i.state == QueueState::Pending)
+                        .count();
+                    let msg = self.tf("dl.queue_added", &[&waiting.to_string()]);
+                    self.toast(&msg, false);
                 }
             });
             ui.add_space(4.0);
@@ -937,6 +1349,48 @@ impl App {
                         }
                     });
                     ui.horizontal(|ui| {
+                        let l_playlist = self.t("dl.playlist");
+                        let hint = self.t("dl.playlist_hint");
+                        if ui
+                            .checkbox(&mut self.dl_playlist, l_playlist)
+                            .on_hover_text(hint)
+                            .changed()
+                        {
+                            self.config.set_bool("playlist", self.dl_playlist);
+                        }
+                        ui.label(self.t("dl.playlist_items"));
+                        let items_hint = self.t("dl.playlist_items_hint");
+                        let playlist = self.dl_playlist;
+                        if ui
+                            .add_enabled(
+                                playlist,
+                                egui::TextEdit::singleline(&mut self.dl_playlist_items)
+                                    .desired_width(110.0)
+                                    .hint_text(items_hint),
+                            )
+                            .changed()
+                        {
+                            // Only a range ever reaches yt-dlp; anything else
+                            // the field collects is dropped as it is typed.
+                            self.dl_playlist_items = clean_playlist_items(&self.dl_playlist_items);
+                            self.config
+                                .set_str("playlist_items", &self.dl_playlist_items);
+                        }
+                        ui.add_space(8.0);
+                        ui.label(self.t("dl.rate_limit"));
+                        let rate_hint = self.t("dl.rate_limit_hint");
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.dl_rate_limit)
+                                    .desired_width(90.0)
+                                    .hint_text(rate_hint),
+                            )
+                            .changed()
+                        {
+                            self.config.set_str("rate_limit", &self.dl_rate_limit);
+                        }
+                    });
+                    ui.horizontal(|ui| {
                         let l_potoken = self.t("dl.potoken");
                         if ui.checkbox(&mut self.dl_potoken, l_potoken).changed() {
                             self.config.set_bool("potoken", self.dl_potoken);
@@ -994,12 +1448,28 @@ impl App {
         });
 
         ui.add_space(6.0);
+        self.ui_queue(ui);
+
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
+            let waiting = self
+                .dl_queue
+                .iter()
+                .filter(|i| i.state == QueueState::Pending)
+                .count();
+            // With something already lined up the button says how much work
+            // pressing it starts, rather than just "Start".
+            let extra = usize::from(!self.dl_url.trim().is_empty());
+            let label = if waiting + extra > 1 {
+                self.tf("dl.start_queue", &[&(waiting + extra).to_string()])
+            } else {
+                self.t("dl.start").to_string()
+            };
             if ui
-                .add_enabled(!self.dl_busy, egui::Button::new(self.t("dl.start")))
+                .add_enabled(!self.dl_busy, egui::Button::new(label))
                 .clicked()
             {
-                self.spawn_download();
+                self.start_downloads();
             }
             if ui
                 .add_enabled(self.dl_busy, egui::Button::new(self.t("common.stop")))
@@ -1014,14 +1484,123 @@ impl App {
         }
 
         ui.add_space(6.0);
+        self.ui_log_toolbar(ui, Task::Download);
+        log_view(ui, "dl_log", &self.dl_log, 200.0, self.dark());
+        let _ = ctx;
+    }
+
+    /// The queue list. Hidden entirely while nothing is lined up, so the tab
+    /// looks exactly as it did for the one-URL-at-a-time case.
+    fn ui_queue(&mut self, ui: &mut egui::Ui) {
+        if self.dl_queue.is_empty() {
+            return;
+        }
+        let lang = self.lang;
+        let mut remove: Option<usize> = None;
+        let mut clear_all = false;
+        let mut clear_done = false;
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(i18n::t(lang, "dl.queue_title")).strong());
+                let running = self
+                    .dl_queue
+                    .iter()
+                    .filter(|i| i.state != QueueState::Pending)
+                    .count();
+                ui.label(
+                    RichText::new(i18n::tf(
+                        lang,
+                        "dl.queue_running",
+                        &[&running.to_string(), &self.dl_queue.len().to_string()],
+                    ))
+                    .size(11.0)
+                    .color(Color32::GRAY),
+                );
+                with_available_right(ui, |ui| {
+                    if ui.button(i18n::t(lang, "dl.queue_clear")).clicked() {
+                        clear_all = true;
+                    }
+                    if ui.button(i18n::t(lang, "dl.queue_clear_done")).clicked() {
+                        clear_done = true;
+                    }
+                });
+            });
+            ui.add_space(2.0);
+            egui::ScrollArea::vertical()
+                .id_salt("dl_queue")
+                .max_height(140.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (i, item) in self.dl_queue.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let (mark, color) = queue_marks(item.state);
+                            ui.label(RichText::new(mark).color(color));
+                            ui.label(
+                                RichText::new(i18n::t(lang, queue_state_key(item.state)))
+                                    .size(11.0)
+                                    .color(color),
+                            );
+                            // Running entries are what the worker is holding;
+                            // dropping one would renumber it mid-flight.
+                            let removable = item.state != QueueState::Running;
+                            if ui
+                                .add_enabled(removable, egui::Button::new("✖").small())
+                                .on_hover_text(i18n::t(lang, "common.remove"))
+                                .clicked()
+                            {
+                                remove = Some(i);
+                            }
+                            ui.label(RichText::new(short_url(&item.url)).size(11.0))
+                                .on_hover_text(&item.url);
+                        });
+                    }
+                });
+        });
+        if let Some(i) = remove {
+            self.dl_queue.remove(i);
+            // The running entry keeps its identity even if the list shrank
+            // above it.
+            if let Some(current) = self.dl_current.as_mut() {
+                if i < *current {
+                    *current -= 1;
+                }
+            }
+        }
+        if clear_done {
+            self.dl_queue
+                .retain(|i| matches!(i.state, QueueState::Pending | QueueState::Running));
+        }
+        if clear_all {
+            // Whatever is downloading right now stays - the list is a plan,
+            // not a kill switch; Stop is.
+            self.dl_queue.retain(|i| i.state == QueueState::Running);
+            self.dl_queue_running = false;
+        }
+        if clear_done || clear_all {
+            self.dl_current = self
+                .dl_queue
+                .iter()
+                .position(|i| i.state == QueueState::Running);
+        }
+    }
+
+    /// Header row above a live log: title plus copy / save / clear.
+    fn ui_log_toolbar(&mut self, ui: &mut egui::Ui, task: Task) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(self.t("common.live_log")).strong());
+            if ui.button(self.t("common.copy")).clicked() {
+                self.copy_log(task);
+            }
+            if ui.button(self.t("common.save")).clicked() {
+                self.save_log(task);
+            }
             if ui.button(self.t("common.clear")).clicked() {
-                self.dl_log.clear();
+                match task {
+                    Task::Download => self.dl_log.clear(),
+                    Task::Convert => self.cv_log.clear(),
+                }
             }
         });
-        log_view(ui, "dl_log", &self.dl_log, 220.0);
-        let _ = ctx;
     }
 
     fn ui_convert(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
@@ -1034,6 +1613,7 @@ impl App {
         ui.add_space(8.0);
 
         let lang = self.lang;
+        let mut probe = false;
         ui.horizontal(|ui| {
             ui.label(self.t("cv.input"));
             // Button first so it stays visible - the TextEdit below fills the
@@ -1062,10 +1642,22 @@ impl App {
                             .to_string_lossy()
                             .to_string();
                     }
+                    probe = true;
                 }
             }
-            ui.add(egui::TextEdit::singleline(&mut self.cv_input).desired_width(f32::INFINITY));
+            // ffprobe starts a process, so a typed path is read once the field
+            // is done rather than on every keystroke.
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.cv_input).desired_width(f32::INFINITY))
+                .lost_focus()
+            {
+                probe = true;
+            }
         });
+        if probe {
+            self.start_media_probe();
+        }
+        self.ui_media_info(ui);
         ui.horizontal(|ui| {
             ui.label(self.t("cv.output"));
             if ui.button(self.t("cv.save_as")).clicked() {
@@ -1159,6 +1751,56 @@ impl App {
             }
             let l_color = self.t("cv.preserve_color");
             ui.checkbox(&mut self.cv_preserve_color, l_color);
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(self.t("cv.trim")).strong());
+                ui.label(self.t("cv.trim_start"));
+                let hint = self.t("cv.trim_hint");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cv_trim_start)
+                        .desired_width(80.0)
+                        .hint_text("0:00"),
+                );
+                ui.label(self.t("cv.trim_end"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cv_trim_end)
+                        .desired_width(80.0)
+                        .hint_text("1:30"),
+                )
+                .on_hover_text(hint);
+            });
+            // Says what the fields currently mean, including when they say
+            // nothing usable yet.
+            let (text, color) = match self.trim_bounds() {
+                Some((None, None)) => (String::new(), Color32::GRAY),
+                Some((start, end)) => {
+                    let from = util::format_clock(start.unwrap_or(0.0));
+                    let to = end
+                        .map(util::format_clock)
+                        .unwrap_or_else(|| self.t("cv.trim_end_of_file").to_string());
+                    let span = match (start, end) {
+                        (s, Some(e)) => util::format_clock(e - s.unwrap_or(0.0)),
+                        _ => format!("{from} -> {to}"),
+                    };
+                    (self.tf("cv.trim_active", &[&span]), Color32::GRAY)
+                }
+                None => (
+                    self.t("cv.trim_bad").to_string(),
+                    Color32::from_rgb(239, 154, 154),
+                ),
+            };
+            if !text.is_empty() {
+                ui.label(RichText::new(text).size(11.0).color(color));
+            }
+
+            if let Some(estimate) = self.output_estimate() {
+                ui.label(
+                    RichText::new(self.tf("cv.estimate", &[&estimate]))
+                        .size(11.0)
+                        .color(Color32::GRAY),
+                );
+            }
         });
 
         ui.add_space(6.0);
@@ -1175,18 +1817,96 @@ impl App {
             {
                 self.stop_convert();
             }
-            if ui.button(self.t("cv.clear_log")).clicked() {
-                self.cv_log.clear();
+            // Only meaningful once something has actually been written.
+            let done = !self.cv_last_output.is_empty();
+            if ui
+                .add_enabled(done, egui::Button::new(self.t("cv.open_output")))
+                .clicked()
+            {
+                if let Some(parent) = Path::new(&self.cv_last_output).parent() {
+                    open_folder(&parent.to_string_lossy());
+                }
             }
+            ui.label(&self.cv_status);
         });
         if let Some(p) = self.cv_progress {
             ui.add(egui::ProgressBar::new(p).desired_height(6.0));
         }
-        ui.label(&self.cv_status);
 
         ui.add_space(6.0);
-        ui.label(RichText::new(self.t("common.live_log")).strong());
-        log_view(ui, "cv_log", &self.cv_log, 260.0);
+        self.ui_log_toolbar(ui, Task::Convert);
+        log_view(ui, "cv_log", &self.cv_log, 240.0, self.dark());
+    }
+
+    /// What ffprobe found in the chosen input, once it has answered.
+    fn ui_media_info(&mut self, ui: &mut egui::Ui) {
+        if self.cv_input.trim().is_empty() {
+            return;
+        }
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(self.t("cv.info")).strong());
+                if self.cv_info_probing {
+                    ui.label(
+                        RichText::new(self.t("cv.info_probing"))
+                            .size(11.0)
+                            .color(Color32::GRAY),
+                    );
+                    return;
+                }
+                let Some(info) = &self.cv_info else {
+                    ui.label(
+                        RichText::new(self.t("cv.info_none"))
+                            .size(11.0)
+                            .color(Color32::from_rgb(255, 183, 77)),
+                    );
+                    return;
+                };
+                let dim = Color32::GRAY;
+                let mut fact = |label: &str, value: String| {
+                    if value.is_empty() {
+                        return;
+                    }
+                    ui.label(RichText::new(format!("{label}:")).size(11.0).color(dim));
+                    ui.label(RichText::new(value).size(11.0));
+                    ui.add_space(8.0);
+                };
+                fact(
+                    self.t("cv.info_length"),
+                    info.duration.map(util::format_clock).unwrap_or_default(),
+                );
+                let mut video = String::new();
+                if info.width > 0 && info.height > 0 {
+                    video = format!("{}x{}", info.width, info.height);
+                }
+                if let Some(fps) = info.fps {
+                    video = format!("{video} @ {fps:.2} fps");
+                }
+                if !info.vcodec.is_empty() {
+                    video = format!("{} ({})", video.trim(), info.vcodec);
+                }
+                fact(self.t("cv.info_video"), video.trim().to_string());
+                fact(self.t("cv.info_audio"), info.acodec.clone());
+                fact(self.t("cv.info_size"), util::format_bytes(info.size_bytes));
+            });
+        });
+    }
+
+    /// Rough size of what a custom-bitrate run will write.
+    ///
+    /// Only the custom-bitrate mode can be estimated at all - CRF decides its
+    /// rate from the picture, which nothing here can predict.
+    fn output_estimate(&self) -> Option<String> {
+        if self.cv_bitrate_mode != "custom" || util::convert_audio_ext(&self.cv_codec).is_some() {
+            return None;
+        }
+        let total = self.cv_info.as_ref()?.duration?;
+        let (start, end) = self.trim_bounds()?;
+        let start = start.unwrap_or(0.0).min(total);
+        let seconds = end.map(|e| e - start).unwrap_or(total - start).max(0.0);
+        // Video plus the 192 kbit/s the profiles use for audio.
+        let bits = (self.cv_custom_br as f64 * 1_000_000.0 + 192_000.0) * seconds;
+        Some(util::format_bytes((bits / 8.0) as u64))
     }
 
     fn ui_setup(&mut self, ui: &mut egui::Ui) {
@@ -1296,6 +2016,18 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.add_space(8.0);
+        // The header carries a one-click toggle; this is where the setting
+        // itself lives, next to the other things that stick around.
+        let mut theme = self.theme.clone();
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(self.t("setup.appearance")).strong());
+                combo(ui, lang, "theme", &mut theme, THEME_OPTIONS);
+            });
+        });
+        self.set_theme(&theme);
+
+        ui.add_space(8.0);
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(RichText::new(format!("{APP_NAME} v{VERSION}")).strong());
             ui.add_space(4.0);
@@ -1337,6 +2069,188 @@ impl App {
         }
     }
 
+    fn ui_history(&mut self, ui: &mut egui::Ui) {
+        ui.heading(self.t("nav.history"));
+        ui.label(
+            RichText::new(self.t("hist.subtitle"))
+                .color(Color32::GRAY)
+                .size(12.0),
+        );
+        ui.add_space(8.0);
+
+        let lang = self.lang;
+        let matches_filter = |e: &history::Entry, filter: &str| match filter {
+            "download" => e.kind == history::Kind::Download,
+            "convert" => e.kind == history::Kind::Convert,
+            _ => true,
+        };
+        let shown = self
+            .history
+            .iter()
+            .filter(|e| matches_filter(e, &self.hist_filter))
+            .count();
+
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            combo(
+                ui,
+                lang,
+                "hist_filter",
+                &mut self.hist_filter,
+                HISTORY_FILTER_OPTIONS,
+            );
+            ui.label(
+                RichText::new(i18n::tf(
+                    lang,
+                    "hist.count",
+                    &[&shown.to_string(), &self.history.len().to_string()],
+                ))
+                .size(11.0)
+                .color(Color32::GRAY),
+            );
+            with_available_right(ui, |ui| {
+                if ui
+                    .add_enabled(
+                        !self.history.is_empty(),
+                        egui::Button::new(i18n::t(lang, "hist.clear")),
+                    )
+                    .clicked()
+                {
+                    clear = true;
+                }
+            });
+        });
+        ui.add_space(6.0);
+
+        if self.history.is_empty() {
+            ui.label(
+                RichText::new(self.t("hist.empty"))
+                    .color(Color32::GRAY)
+                    .size(12.0),
+            );
+        }
+
+        // Actions are collected and applied after the loop - acting inside it
+        // would mean mutating the list the loop is walking.
+        let mut open_file: Option<String> = None;
+        let mut open_dir: Option<String> = None;
+        let mut copy: Option<String> = None;
+        let mut reuse: Option<String> = None;
+        let mut remove: Option<usize> = None;
+
+        egui::ScrollArea::vertical()
+            .id_salt("history")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, entry) in self.history.iter().enumerate() {
+                    if !matches_filter(entry, &self.hist_filter) {
+                        continue;
+                    }
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(entry.kind.icon()).color(accent()));
+                            ui.label(RichText::new(&entry.name).strong())
+                                .on_hover_text(&entry.path);
+                            with_available_right(ui, |ui| {
+                                if !entry.url.is_empty() {
+                                    if ui
+                                        .small_button("↩")
+                                        .on_hover_text(i18n::t(lang, "hist.reuse"))
+                                        .clicked()
+                                    {
+                                        reuse = Some(entry.url.clone());
+                                    }
+                                    if ui
+                                        .small_button("🔗")
+                                        .on_hover_text(i18n::t(lang, "hist.copy_url"))
+                                        .clicked()
+                                    {
+                                        copy = Some(entry.url.clone());
+                                    }
+                                }
+                                if !entry.path.is_empty()
+                                    && ui
+                                        .small_button("📋")
+                                        .on_hover_text(i18n::t(lang, "hist.copy_path"))
+                                        .clicked()
+                                {
+                                    copy = Some(entry.path.clone());
+                                }
+                                let exists = entry.exists();
+                                if ui
+                                    .add_enabled(exists, egui::Button::new("📂").small())
+                                    .on_hover_text(i18n::t(lang, "common.open_folder"))
+                                    .clicked()
+                                {
+                                    open_dir = entry.folder();
+                                }
+                                if ui
+                                    .add_enabled(exists, egui::Button::new("▶").small())
+                                    .on_hover_text(i18n::t(lang, "common.open_file"))
+                                    .clicked()
+                                {
+                                    open_file = Some(entry.path.clone());
+                                }
+                                if ui
+                                    .small_button("✖")
+                                    .on_hover_text(i18n::t(lang, "common.remove"))
+                                    .clicked()
+                                {
+                                    remove = Some(i);
+                                }
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            let dim = Color32::GRAY;
+                            if !entry.detail.is_empty() {
+                                ui.label(RichText::new(&entry.detail).size(11.0).color(dim));
+                                ui.label(RichText::new("·").size(11.0).color(dim));
+                            }
+                            ui.label(
+                                RichText::new(relative_when(lang, entry.when))
+                                    .size(11.0)
+                                    .color(dim),
+                            );
+                            if !entry.path.is_empty() && !entry.exists() {
+                                ui.label(RichText::new("·").size(11.0).color(dim));
+                                ui.label(
+                                    RichText::new(i18n::t(lang, "hist.missing"))
+                                        .size(11.0)
+                                        .color(Color32::from_rgb(255, 183, 77)),
+                                );
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
+            });
+
+        if let Some(path) = open_file {
+            open_path(&path);
+        }
+        if let Some(dir) = open_dir {
+            open_folder(&dir);
+        }
+        if let Some(text) = copy {
+            if copy_to_clipboard(&text) {
+                self.toast_key("hist.copied", false);
+            }
+        }
+        if let Some(url) = reuse {
+            self.dl_url = url;
+            self.tab = TAB_DOWNLOAD;
+            self.toast_key("hist.reused", false);
+        }
+        if let Some(i) = remove {
+            self.history.remove(i);
+            history::store(&mut self.config, &self.history);
+        }
+        if clear {
+            self.history.clear();
+            history::store(&mut self.config, &self.history);
+        }
+    }
+
     fn ui_info(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(10.0);
@@ -1346,6 +2260,10 @@ impl App {
         });
         let features = [
             ("info.f_download", "info.f_download_d"),
+            ("info.f_queue", "info.f_queue_d"),
+            ("info.f_playlist", "info.f_playlist_d"),
+            ("info.f_trim", "info.f_trim_d"),
+            ("info.f_history", "info.f_history_d"),
             ("info.f_antibot", "info.f_antibot_d"),
             ("info.f_vegas", "info.f_vegas_d"),
             ("info.f_audio", "info.f_audio_d"),
@@ -1369,6 +2287,78 @@ impl App {
                 });
             }
         });
+    }
+
+    /// Keyboard shortcuts: Ctrl+1..5 for the tabs, Ctrl+Enter to start the
+    /// visible tab, Esc to stop whatever is running.
+    ///
+    /// A modal owns the keyboard while it is up, so nothing is read then -
+    /// Esc there means "close the dialog", not "cancel my download".
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if self.pending_conflict.is_some() || !matches!(self.update_ui, UpdateUi::Idle) {
+            return;
+        }
+        enum Action {
+            Tab(usize),
+            Start,
+            Stop,
+        }
+        let tabs = [
+            (TAB_DOWNLOAD, egui::Key::Num1),
+            (TAB_CONVERT, egui::Key::Num2),
+            (TAB_HISTORY, egui::Key::Num3),
+            (TAB_SETUP, egui::Key::Num4),
+            (TAB_INFO, egui::Key::Num5),
+        ];
+        let action = ctx.input(|i| {
+            if i.modifiers.command {
+                if let Some((tab, _)) = tabs.iter().find(|(_, key)| i.key_pressed(*key)) {
+                    return Some(Action::Tab(*tab));
+                }
+                if i.key_pressed(egui::Key::Enter) {
+                    return Some(Action::Start);
+                }
+            }
+            i.key_pressed(egui::Key::Escape).then_some(Action::Stop)
+        });
+        match action {
+            Some(Action::Tab(tab)) => self.tab = tab,
+            Some(Action::Start) => match self.tab {
+                TAB_DOWNLOAD => self.start_downloads(),
+                TAB_CONVERT => self.spawn_convert(),
+                _ => {}
+            },
+            Some(Action::Stop) => {
+                if self.dl_busy {
+                    self.stop_download();
+                }
+                if self.cv_busy {
+                    self.stop_convert();
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Mirrors the running job into the window title, so a minimised window
+    /// still says how far along it is.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let base = format!("{APP_NAME} v{VERSION}");
+        let running = if self.dl_busy {
+            self.dl_progress.map(|p| (p, self.t("nav.download")))
+        } else if self.cv_busy {
+            self.cv_progress.map(|p| (p, self.t("nav.convert")))
+        } else {
+            None
+        };
+        let title = match running {
+            Some((p, what)) => format!("{:.0}% {what} - {base}", p * 100.0),
+            None => base,
+        };
+        if title != self.title {
+            self.title = title.clone();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        }
     }
 
     fn show_conflict_modal(&mut self, ctx: &egui::Context) {
@@ -1606,6 +2596,8 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain();
+        self.handle_shortcuts(ctx);
+        self.sync_title(ctx);
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -1628,9 +2620,10 @@ impl eframe::App for App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
-                    0 => self.ui_download(ui, ctx),
-                    1 => self.ui_convert(ui, ctx),
-                    2 => self.ui_setup(ui),
+                    TAB_DOWNLOAD => self.ui_download(ui, ctx),
+                    TAB_CONVERT => self.ui_convert(ui, ctx),
+                    TAB_HISTORY => self.ui_history(ui),
+                    TAB_SETUP => self.ui_setup(ui),
                     _ => self.ui_info(ui),
                 });
         });
@@ -1653,6 +2646,119 @@ impl eframe::App for App {
 }
 
 // ---------------- free helpers ----------------
+
+/// The one colour the app calls its own, readable on both themes.
+fn accent() -> Color32 {
+    Color32::from_rgb(38, 166, 189)
+}
+
+/// Installs the visuals and the spacing both themes share.
+///
+/// Only the palette differs between them; every rounding, margin and font
+/// size is set once here so the two cannot drift apart.
+fn apply_style(ctx: &egui::Context, theme: &str) {
+    let dark = theme != "light";
+    let mut visuals = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    visuals.selection.bg_fill = accent().linear_multiply(if dark { 0.45 } else { 0.30 });
+    visuals.selection.stroke.color = if dark {
+        Color32::from_rgb(224, 247, 250)
+    } else {
+        Color32::from_rgb(10, 60, 70)
+    };
+    visuals.hyperlink_color = accent();
+    let rounding = egui::Rounding::same(6.0);
+    visuals.widgets.noninteractive.rounding = rounding;
+    visuals.widgets.inactive.rounding = rounding;
+    visuals.widgets.hovered.rounding = rounding;
+    visuals.widgets.active.rounding = rounding;
+    visuals.widgets.open.rounding = rounding;
+    visuals.window_rounding = egui::Rounding::same(8.0);
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 4.0);
+    style.spacing.indent = 18.0;
+    ctx.set_style(style);
+}
+
+fn is_http_url(url: &str) -> bool {
+    let lo = url.to_lowercase();
+    lo.starts_with("http://") || lo.starts_with("https://")
+}
+
+fn copy_to_clipboard(text: &str) -> bool {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text.to_string()))
+        .is_ok()
+}
+
+/// Symbol and colour for one queue state.
+fn queue_marks(state: QueueState) -> (&'static str, Color32) {
+    match state {
+        QueueState::Pending => ("○", Color32::GRAY),
+        QueueState::Running => ("▶", accent()),
+        QueueState::Done => ("✔", Color32::from_rgb(129, 199, 132)),
+        QueueState::Failed => ("✖", Color32::from_rgb(239, 154, 154)),
+        QueueState::Skipped => ("–", Color32::from_rgb(255, 183, 77)),
+    }
+}
+
+fn queue_state_key(state: QueueState) -> &'static str {
+    match state {
+        QueueState::Pending => "qs.pending",
+        QueueState::Running => "qs.running",
+        QueueState::Done => "qs.done",
+        QueueState::Failed => "qs.failed",
+        QueueState::Skipped => "qs.skipped",
+    }
+}
+
+/// Shortens a URL for the queue list; the full one stays in the tooltip.
+fn short_url(url: &str) -> String {
+    const MAX: usize = 72;
+    let trimmed = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+    if trimmed.chars().count() <= MAX {
+        return trimmed.to_string();
+    }
+    // Cut on character boundaries - a URL may well carry non-ASCII.
+    let head: String = trimmed.chars().take(MAX - 12).collect();
+    let tail: String = {
+        let all: Vec<char> = trimmed.chars().collect();
+        all[all.len() - 9..].iter().collect()
+    };
+    format!("{head}...{tail}")
+}
+
+/// How long ago something happened, in the coarsest unit that still says
+/// something. Absolute dates would need a calendar and a timezone; the
+/// history is read as "what did I just do", for which this is enough.
+fn relative_when(lang: Lang, when: u64) -> String {
+    if when == 0 {
+        return String::new();
+    }
+    let now = history::now_secs();
+    let secs = now.saturating_sub(when);
+    if secs < 90 {
+        return i18n::t(lang, "when.now").to_string();
+    }
+    let minutes = secs / 60;
+    if minutes < 60 {
+        return i18n::tf(lang, "when.minutes", &[&minutes.to_string()]);
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return i18n::tf(lang, "when.hours", &[&hours.to_string()]);
+    }
+    i18n::tf(lang, "when.days", &[&(hours / 24).to_string()])
+}
 
 fn label_of(lang: Lang, current: &str, options: &[(&'static str, &'static str)]) -> String {
     options
@@ -1729,39 +2835,50 @@ fn codec_hint(key: &str, audio_only: bool) -> Option<&'static str> {
     }
 }
 
-fn log_color(line: &str) -> Color32 {
+/// Colour of one log line. Both palettes carry the same four meanings; the
+/// light one only darkens them enough to stay readable on a pale background.
+fn log_color(line: &str, dark: bool) -> Color32 {
+    let pick = |d: (u8, u8, u8), l: (u8, u8, u8)| {
+        let (r, g, b) = if dark { d } else { l };
+        Color32::from_rgb(r, g, b)
+    };
     if line.starts_with("===") || line.starts_with("---") {
-        return Color32::from_rgb(159, 168, 218);
+        return pick((159, 168, 218), (63, 81, 181));
     }
     let lo = line.to_lowercase();
     for kw in ["error", "failed", "traceback", "warning", "warn"] {
         if lo.contains(kw) {
-            return Color32::from_rgb(239, 154, 154);
+            return pick((239, 154, 154), (183, 28, 28));
         }
     }
     for kw in ["success", "completed", "complete"] {
         if lo.contains(kw) {
-            return Color32::from_rgb(165, 214, 167);
+            return pick((165, 214, 167), (27, 94, 32));
         }
     }
     for kw in ["download:", "%|", "frame=", "fps=", "speed=", "bitrate="] {
         if lo.contains(kw) {
-            return Color32::from_rgb(128, 222, 234);
+            return pick((128, 222, 234), (0, 105, 122));
         }
     }
-    Color32::from_rgb(200, 200, 200)
+    pick((200, 200, 200), (55, 55, 60))
 }
 
 const LOG_FONT_SIZE: f32 = 11.0;
 
-fn log_view(ui: &mut egui::Ui, id: &str, lines: &[String], height: f32) {
+fn log_view(ui: &mut egui::Ui, id: &str, lines: &[String], height: f32, dark: bool) {
     // Rows are uniform monospace, so only the visible slice needs widgets.
     // Emitting all of them meant up to MAX_LOG labels per frame while a job
     // was running and repaints were frequent.
     let row_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(LOG_FONT_SIZE)))
         + ui.spacing().item_spacing.y;
+    let fill = if dark {
+        Color32::from_rgb(20, 20, 24)
+    } else {
+        Color32::from_rgb(244, 245, 248)
+    };
     egui::Frame::none()
-        .fill(Color32::from_rgb(20, 20, 24))
+        .fill(fill)
         .inner_margin(8.0)
         .rounding(6.0)
         .show(ui, |ui| {
@@ -1780,7 +2897,7 @@ fn log_view(ui: &mut egui::Ui, id: &str, lines: &[String], height: f32) {
                             RichText::new(text)
                                 .monospace()
                                 .size(LOG_FONT_SIZE)
-                                .color(log_color(line)),
+                                .color(log_color(line, dark)),
                         );
                     }
                 });
@@ -1878,6 +2995,29 @@ fn open_url(url: &str) {
     }
 }
 
+/// Hands a file to whatever the desktop opens it with.
+///
+/// Only a path that exists is passed on, and it goes to the opener as a
+/// single argument, so nothing in the name can turn into a second one.
+fn open_path(path: &str) {
+    if path.is_empty() || !Path::new(path).is_file() {
+        return;
+    }
+    let p = PathBuf::from(path);
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("explorer").arg(p).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(p).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+    }
+}
+
 fn open_folder(path: &str) {
     if path.is_empty() || !Path::new(path).exists() {
         return;
@@ -1894,5 +3034,47 @@ fn open_folder(path: &str) {
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("xdg-open").arg(p).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_http_urls_are_accepted_for_the_queue() {
+        assert!(is_http_url("https://example.com/v"));
+        assert!(is_http_url("HTTP://example.com/v"));
+        assert!(!is_http_url("file:///etc/passwd"));
+        assert!(!is_http_url("example.com/v"));
+        assert!(!is_http_url(""));
+    }
+
+    #[test]
+    fn a_long_url_is_shortened_without_splitting_a_character() {
+        let short = "https://youtu.be/abc";
+        assert_eq!(short_url(short), "youtu.be/abc");
+        let long = format!("https://example.com/{}", "ä".repeat(200));
+        let out = short_url(&long);
+        assert!(out.contains("..."), "{out}");
+        assert!(out.chars().count() < 100, "{out}");
+        // The tail is the end of the URL, so two similar links stay apart.
+        assert!(out.ends_with(&"ä".repeat(9)), "{out}");
+    }
+
+    #[test]
+    fn every_queue_state_has_a_translated_label() {
+        for state in [
+            QueueState::Pending,
+            QueueState::Running,
+            QueueState::Done,
+            QueueState::Failed,
+            QueueState::Skipped,
+        ] {
+            let key = queue_state_key(state);
+            for lang in i18n::LANGS {
+                assert_ne!(i18n::t(lang, key), key, "missing {key} for {lang:?}");
+            }
+        }
     }
 }

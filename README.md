@@ -26,24 +26,35 @@ See the [changelog](CHANGELOG.md) for what changed in each release.
 
 - **Languages** — English (default), German and French, switchable at any time
   from the picker in the header. The choice is remembered in the config.
+- **Themes** — dark or light, from the button in the header or the Setup tab.
 - **Download tab** — quality presets (best / AV1 / 4K…480p / audio MP3·WAV·Opus),
-  cookies (browser or `cookies.txt`), existing-file handling (ask / auto-rename /
+  a **queue** that works any number of links off one after another, whole
+  **playlists** (optionally only a range) into a folder of their own, cookies
+  (browser or `cookies.txt`), existing-file handling (ask / auto-rename /
   overwrite / skip) with an up-front filename probe, a folder picker for the save
   location, and advanced options: impersonate (anti-bot), SponsorBlock,
-  thumbnail/metadata/chapter embedding, subtitles, and PO-token / bgutil support.
-  Live progress log. Instagram downloads are saved under a neutral
-  `video-1234.mp4` name, since their title carries the uploader's account name.
+  thumbnail/metadata/chapter embedding, subtitles, a speed limit, and
+  PO-token / bgutil support. Live progress log. Instagram downloads are saved
+  under a neutral `video-1234.mp4` name, since their title carries the
+  uploader's account name.
 - **Convert tab** — full codec matrix (H.264/H.265/AV1/VP9, ProRes, DNxHR,
   Vegas Sync Fix, YouTube/social delivery presets, MP3/WAV audio), hardware
   encoder selection (NVENC / AMF / QSV / auto-detect), CRF or custom bitrate,
-  HDR-aware color-metadata preservation, and live FFmpeg progress. Browse and
-  Save-as file pickers for input/output.
+  **trimming** to a section between two timestamps, an ffprobe summary of the
+  source file (length, resolution, frame rate, codecs, size) with a size
+  estimate for custom bitrates, HDR-aware color-metadata preservation, and live
+  FFmpeg progress. Browse and Save-as file pickers for input/output.
+- **History tab** — every finished download and conversion, with the file, the
+  URL it came from and the preset it ran with. Open the file or its folder,
+  copy the path or link, or load the URL back into the Download tab.
 - **Setup tab** — install/update yt-dlp (Stable/Nightly/Master channels),
   install FFmpeg (via ffbinaries) and Deno, with status readout. The versions
   shown are cached against the binaries on disk so starting the app costs no
   process launches; **Re-check** re-reads them on demand.
 - **Info tab** — feature overview.
-- Config persisted as JSON in `~/.video_tool_v3/config.json`.
+- **Keyboard** — `Ctrl`+`1`..`5` switch tabs, `Ctrl`+`Enter` starts the visible
+  tab, `Esc` stops what is running.
+- Config and history persisted as JSON in `~/.video_tool_v3/config.json`.
 
 ## Build from source
 
@@ -77,10 +88,11 @@ assets/
 build.rs        embeds the icon into the .exe on Windows
 src/
   main.rs       entry point + window setup
-  app.rs        egui UI (all four tabs)
+  app.rs        egui UI (all five tabs)
   binaries.rs   yt-dlp/ffmpeg/deno management + SHA-256 verification
   download.rs   yt-dlp command building + download worker
   convert.rs    FFmpeg command building + conversion worker
+  history.rs    the finished-jobs list behind the History tab
   config.rs     JSON settings store
   consts.rs     app constants and option tables
   i18n.rs       English/German/French translation table

@@ -28,6 +28,48 @@ pub enum UiMsg {
     UpdateStatus(String),
     /// Outcome of installing an update; Ok carries the new version string.
     UpdateInstalled(Result<String, String>),
+    /// How a worker ended. Always sent before the matching `Busy(_, false)`,
+    /// so the queue driver sees the outcome before it advances.
+    Finished(Task, Outcome),
+    /// Result of an ffprobe run against the Convert tab's input file.
+    MediaInfo(Box<Option<MediaInfo>>),
+}
+
+/// How a worker run ended, as far as the UI cares.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Finished and wrote (or already had) a file; carries it when known.
+    Success(Option<PathBuf>),
+    /// Nothing was written because the user or the conflict rule said so.
+    Skipped,
+    Cancelled,
+    Failed,
+}
+
+/// State of one entry in the download queue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QueueState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+/// What ffprobe could tell us about a file, for the Convert tab's summary.
+#[derive(Clone, Default, Debug)]
+pub struct MediaInfo {
+    /// The file this describes - a late answer for a since-changed input is
+    /// dropped rather than shown against the wrong file.
+    pub path: String,
+    pub duration: Option<f64>,
+    pub width: u32,
+    pub height: u32,
+    pub fps: Option<f64>,
+    pub vcodec: String,
+    pub acodec: String,
+    pub size_bytes: u64,
+    pub bit_rate: Option<u64>,
 }
 
 /// Whether an update check was triggered by the user or ran on start.
@@ -68,6 +110,12 @@ pub struct DownloadOpts {
     pub potoken_url: String,
     pub plugins_dir: String,
     pub conflict: String,
+    /// Fetch every entry of a playlist/channel URL instead of just the video.
+    pub playlist: bool,
+    /// Optional `--playlist-items` range, already stripped to safe characters.
+    pub playlist_items: String,
+    /// Optional `--limit-rate` value ("2M"), empty for unlimited.
+    pub rate_limit: String,
 }
 
 /// A request from the download worker asking the UI to resolve a file collision.

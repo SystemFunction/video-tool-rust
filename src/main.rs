@@ -8,6 +8,7 @@ mod consts;
 mod convert;
 mod download;
 mod emit;
+mod history;
 mod i18n;
 mod types;
 mod update;

@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,7 @@ use std::time::Instant;
 use crate::binaries::{no_window, Binaries};
 use crate::emit::Emitter;
 use crate::i18n::{t, tf, Lang};
-use crate::types::Task;
+use crate::types::{MediaInfo, Outcome, Task, UiMsg};
 use crate::util;
 
 type ChildSlot = Arc<Mutex<Option<Child>>>;
@@ -34,7 +34,7 @@ impl CvCtx {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ConvertParams {
     pub codec_key: String,
     pub hw_setting: String,
@@ -42,6 +42,27 @@ pub struct ConvertParams {
     pub use_custom: bool,
     pub custom_br: i32,
     pub preserve_color: bool,
+    /// Section of the source to keep, in seconds from its start. `None` on
+    /// either side means "from the beginning" / "to the end".
+    pub trim_start: Option<f64>,
+    pub trim_end: Option<f64>,
+}
+
+impl ConvertParams {
+    /// Length of the selected section, or `None` when nothing was trimmed.
+    ///
+    /// Both bounds are input options, so ffmpeg is told where to start and
+    /// how much to read - which keeps "end" meaning a position in the source
+    /// rather than an offset into the trimmed result.
+    pub fn trim_duration(&self) -> Option<f64> {
+        let end = self.trim_end?;
+        let start = self.trim_start.unwrap_or(0.0);
+        (end > start).then_some(end - start)
+    }
+
+    fn has_trim(&self) -> bool {
+        self.trim_start.map(|s| s > 0.0).unwrap_or(false) || self.trim_duration().is_some()
+    }
 }
 
 pub struct Profile {
@@ -57,6 +78,10 @@ pub struct Profile {
     pub crf: i32,
     pub hw_resolved: String,
     pub hw_requested: String,
+    /// Where the kept section starts, in seconds from the source's start.
+    pub trim_start: Option<f64>,
+    /// How long that section is; `None` runs to the end of the file.
+    pub trim_duration: Option<f64>,
 }
 
 fn v(items: &[&str]) -> Vec<String> {
@@ -283,7 +308,24 @@ pub fn build_convert_args(
         crf,
         hw_resolved: hw,
         hw_requested,
+        trim_start: params.trim_start.filter(|s| *s > 0.0),
+        trim_duration: params.trim_duration(),
     }
+}
+
+/// The `-ss`/`-t` pair, as input options so the decoder skips ahead instead
+/// of decoding and discarding everything before the cut.
+fn seek_args(profile: &Profile) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(start) = profile.trim_start {
+        out.push("-ss".into());
+        out.push(format!("{start:.3}"));
+    }
+    if let Some(dur) = profile.trim_duration {
+        out.push("-t".into());
+        out.push(format!("{dur:.3}"));
+    }
+    out
 }
 
 pub fn build_ffmpeg_cmd(
@@ -294,12 +336,16 @@ pub fn build_ffmpeg_cmd(
     color_meta: &BTreeMap<String, String>,
     preserve_color: bool,
 ) -> Vec<String> {
+    let seek = seek_args(profile);
     if profile.audio_only {
         let mut cmd = v(&[
             ffmpeg, "-hide_banner", "-nostdin", "-y", "-progress", "pipe:1",
-            "-stats_period", "0.5", "-nostats", "-i", input_file, "-vn", "-map", "0:a:0",
-            "-map_metadata", "0", "-c:a",
+            "-stats_period", "0.5", "-nostats",
         ]);
+        cmd.extend(seek.iter().cloned());
+        cmd.extend(v(&[
+            "-i", input_file, "-vn", "-map", "0:a:0", "-map_metadata", "0", "-c:a",
+        ]));
         cmd.push(profile.audio_codec.clone());
         if let Some(br) = &profile.audio_bitrate {
             cmd.push("-b:a".into());
@@ -313,10 +359,20 @@ pub fn build_ffmpeg_cmd(
         ffmpeg.to_string(), "-hide_banner".into(), "-nostdin".into(), "-y".into(),
         "-progress".into(), "pipe:1".into(), "-stats_period".into(), "0.5".into(),
         "-nostats".into(),
-        "-fflags".into(), "+genpts".into(), "-i".into(), input_file.to_string(),
+        "-fflags".into(), "+genpts".into(),
+    ];
+    cmd.extend(seek.iter().cloned());
+    cmd.extend(vec![
+        "-i".into(), input_file.to_string(),
         "-map".into(), "0:v:0".into(), "-map".into(), "0:a?".into(),
         "-map_metadata".into(), "0".into(), "-map_chapters".into(), "0".into(),
-    ];
+    ]);
+    // Chapter marks copied from the source point into the part that was cut
+    // away, so a trimmed file gets none rather than wrong ones.
+    if profile.trim_start.is_some() || profile.trim_duration.is_some() {
+        let n = cmd.len();
+        cmd[n - 1] = "-1".into();
+    }
 
     if profile.video_codec != "copy" && !profile.extra.iter().any(|a| a == "-pix_fmt") {
         cmd.push("-pix_fmt".into());
@@ -442,6 +498,59 @@ fn probe_color_meta(bin: &Binaries, file: &str) -> BTreeMap<String, String> {
     meta
 }
 
+/// Everything the Convert tab's summary shows about the chosen input.
+///
+/// Two ffprobe calls: the video stream and the container carry most of it,
+/// the audio codec needs its own stream selector. Both are cheap and this
+/// runs off the UI thread.
+pub fn probe_media_info(bin: &Binaries, file: &str) -> Option<MediaInfo> {
+    let mut info = MediaInfo {
+        path: file.to_string(),
+        ..Default::default()
+    };
+    let video = ffprobe_value(
+        bin,
+        &[
+            "-v", "quiet", "-select_streams", "v:0", "-show_entries",
+            "stream=codec_name,width,height,r_frame_rate", "-show_entries",
+            "format=duration,size,bit_rate", "-of", "default=noprint_wrappers=1", file,
+        ],
+    )?;
+    for line in video.lines() {
+        let Some((key, val)) = line.split_once('=') else { continue };
+        let val = val.trim();
+        match key.trim() {
+            "codec_name" => info.vcodec = val.to_string(),
+            "width" => info.width = val.parse().unwrap_or(0),
+            "height" => info.height = val.parse().unwrap_or(0),
+            "r_frame_rate" => info.fps = parse_frame_rate(val),
+            "duration" => info.duration = val.parse().ok(),
+            "size" => info.size_bytes = val.parse().unwrap_or(0),
+            "bit_rate" => info.bit_rate = val.parse().ok(),
+            _ => {}
+        }
+    }
+    info.acodec = ffprobe_value(
+        bin,
+        &[
+            "-v", "quiet", "-select_streams", "a:0", "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1", file,
+        ],
+    )
+    .unwrap_or_default();
+    if info.size_bytes == 0 {
+        info.size_bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    }
+    Some(info)
+}
+
+/// ffprobe reports frame rates as an exact fraction ("30000/1001").
+fn parse_frame_rate(text: &str) -> Option<f64> {
+    let (num, den) = text.split_once('/')?;
+    let (num, den): (f64, f64) = (num.parse().ok()?, den.parse().ok()?);
+    (den > 0.0 && num > 0.0).then(|| num / den)
+}
+
 /// The conversion worker (runs on its own thread).
 ///
 /// The panic guard mirrors the download worker: without it a panic here would
@@ -472,7 +581,15 @@ fn run_conversion_inner(
         BTreeMap::new()
     };
     let profile = build_convert_args(&ctx.bin, params, source_pix.as_deref());
-    let duration = probe_duration(&ctx.bin, input_file);
+    // Progress is measured against what this run actually writes, so a
+    // trimmed conversion has to count against the section, not the source.
+    let duration = probe_duration(&ctx.bin, input_file).map(|total| {
+        let start = profile.trim_start.unwrap_or(0.0).min(total);
+        match profile.trim_duration {
+            Some(d) => d.min(total - start),
+            None => total - start,
+        }
+    });
 
     let cmd = build_ffmpeg_cmd(&ffmpeg, input_file, output_file, &profile, &color_meta, params.preserve_color);
 
@@ -507,6 +624,21 @@ fn run_conversion_inner(
     if let Some(d) = duration {
         ctx.em
             .log(Task::Convert, ctx.tf("cvw.duration", &[&format!("{d:.1}")]));
+    }
+    if params.has_trim() {
+        ctx.em.log(
+            Task::Convert,
+            ctx.tf(
+                "cvw.trim",
+                &[
+                    &util::format_clock(params.trim_start.unwrap_or(0.0)),
+                    &params
+                        .trim_end
+                        .map(util::format_clock)
+                        .unwrap_or_else(|| ctx.t("cv.trim_end_of_file").to_string()),
+                ],
+            ),
+        );
     }
     ctx.em.log(Task::Convert, "-".repeat(44));
 
@@ -625,16 +757,22 @@ fn run_conversion_inner(
     if ctx.cancel.load(Ordering::SeqCst) {
         ctx.em.status(Task::Convert, ctx.t("status.cancelled"));
         ctx.em.log(Task::Convert, ctx.t("cvw.cancelled_log"));
+        ctx.em.send(UiMsg::Finished(Task::Convert, Outcome::Cancelled));
     } else if code == 0 {
         ctx.em.progress(Task::Convert, 1.0);
         ctx.em.status(Task::Convert, ctx.t("cvw.completed"));
         ctx.em.log(Task::Convert, ctx.t("cvw.success_log"));
         ctx.em.toast(ctx.t("cvw.success_toast"), false);
+        ctx.em.send(UiMsg::Finished(
+            Task::Convert,
+            Outcome::Success(Some(PathBuf::from(output_file))),
+        ));
     } else {
         ctx.em.status(Task::Convert, ctx.t("cvw.failed"));
         ctx.em
             .log(Task::Convert, ctx.tf("cvw.failed_log", &[&code.to_string()]));
         ctx.em.toast(ctx.t("cvw.failed"), true);
+        ctx.em.send(UiMsg::Finished(Task::Convert, Outcome::Failed));
     }
 }
 
@@ -659,4 +797,93 @@ pub fn file_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_with(trim_start: Option<f64>, trim_end: Option<f64>) -> Profile {
+        let params = ConvertParams {
+            codec_key: "h264".into(),
+            hw_setting: "cpu".into(),
+            crf: 20,
+            trim_start,
+            trim_end,
+            ..Default::default()
+        };
+        let bin = Binaries::new();
+        build_convert_args(&bin, &params, None)
+    }
+
+    fn line(profile: &Profile) -> String {
+        build_ffmpeg_cmd(
+            "ffmpeg",
+            "in.mp4",
+            "out.mp4",
+            profile,
+            &BTreeMap::new(),
+            false,
+        )
+        .join(" ")
+    }
+
+    #[test]
+    fn an_untrimmed_conversion_looks_exactly_as_it_did() {
+        let l = line(&profile_with(None, None));
+        assert!(!l.contains("-ss"), "{l}");
+        assert!(!l.contains(" -t "), "{l}");
+        assert!(l.contains("-map_chapters 0"), "{l}");
+    }
+
+    #[test]
+    fn a_trim_is_expressed_as_a_start_and_a_length_before_the_input() {
+        let l = line(&profile_with(Some(10.0), Some(25.0)));
+        // Both are input options, so they must come before -i.
+        let ss = l.find("-ss ").unwrap();
+        let t = l.find("-t ").unwrap();
+        let i = l.find("-i ").unwrap();
+        assert!(ss < i && t < i, "{l}");
+        assert!(l.contains("-ss 10.000"), "{l}");
+        // 25s end minus a 10s start is a 15s section, not a 25s one.
+        assert!(l.contains("-t 15.000"), "{l}");
+        // The source's chapter marks describe the untrimmed timeline.
+        assert!(l.contains("-map_chapters -1"), "{l}");
+    }
+
+    #[test]
+    fn an_end_that_is_not_after_the_start_is_no_bound_at_all() {
+        assert_eq!(profile_with(Some(30.0), Some(10.0)).trim_duration, None);
+        assert_eq!(profile_with(Some(30.0), Some(30.0)).trim_duration, None);
+        // A start on its own still seeks, it just has no length.
+        let p = profile_with(Some(5.0), None);
+        assert_eq!(p.trim_start, Some(5.0));
+        assert_eq!(p.trim_duration, None);
+    }
+
+    #[test]
+    fn an_audio_only_run_carries_the_same_cut() {
+        let params = ConvertParams {
+            codec_key: "audio_mp3".into(),
+            hw_setting: "cpu".into(),
+            trim_start: Some(3.0),
+            trim_end: Some(8.0),
+            ..Default::default()
+        };
+        let profile = build_convert_args(&Binaries::new(), &params, None);
+        let l = build_ffmpeg_cmd("ffmpeg", "in.mp4", "out.mp3", &profile, &BTreeMap::new(), false)
+            .join(" ");
+        assert!(l.contains("-ss 3.000"), "{l}");
+        assert!(l.contains("-t 5.000"), "{l}");
+        assert!(l.find("-ss ").unwrap() < l.find("-i ").unwrap(), "{l}");
+    }
+
+    #[test]
+    fn frame_rates_are_read_as_the_fraction_ffprobe_reports() {
+        assert_eq!(parse_frame_rate("30/1"), Some(30.0));
+        assert!((parse_frame_rate("30000/1001").unwrap() - 29.97).abs() < 0.01);
+        // A still image stream reports 0/0.
+        assert_eq!(parse_frame_rate("0/0"), None);
+        assert_eq!(parse_frame_rate("25"), None);
+    }
 }
