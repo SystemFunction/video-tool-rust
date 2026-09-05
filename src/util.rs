@@ -1,5 +1,6 @@
 //! Small pure helpers ported from the Python original.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +16,30 @@ use regex::Regex;
 /// invariant a panic could have left half-updated.
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reads a child process' output line by line, replacing undecodable bytes.
+///
+/// `BufRead::lines` hands back an error for a line that is not valid UTF-8,
+/// and the usual `map_while(Result::ok)` then stops reading for good: the
+/// pipe's read end closes and the child dies on its next write - on Windows
+/// with a bare "[Errno 22] Invalid argument". yt-dlp prints its screen output
+/// in the console code page, so one accented character in a title was enough
+/// to kill a running download.
+pub fn lossy_lines<R: Read>(reader: R) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(reader);
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+        }
+    })
 }
 
 /// Parses an "H:M:S(.frac)" timestamp into seconds.
@@ -418,6 +443,21 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1024), "1.0 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_does_not_end_the_stream() {
+        // "Sparta GY<0xC1>osz" - a title yt-dlp printed in the console code
+        // page. The bad line must not stop the reader, or the child process
+        // loses its pipe mid-download.
+        let mut raw: Vec<u8> = b"[info] one\r\nSparta GY".to_vec();
+        raw.push(0xC1);
+        raw.extend_from_slice(b"osz\n[info] three\n");
+        let lines: Vec<String> = lossy_lines(&raw[..]).collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0], "[info] one");
+        assert!(lines[1].starts_with("Sparta GY"));
+        assert_eq!(lines[2], "[info] three");
     }
 
     #[test]

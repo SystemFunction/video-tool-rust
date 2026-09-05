@@ -1,6 +1,5 @@
 //! yt-dlp command building and the download worker (ported from _run_download).
 
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -229,6 +228,13 @@ pub fn build_download_cmd(
         "--sleep-requests".into(),
         "1".into(),
         "--no-mtime".into(),
+        // Without this yt-dlp writes its screen output in the ANSI code page
+        // (cp1252 on a German Windows), so a title carrying anything outside
+        // that page arrived as bytes we cannot decode. The frozen build
+        // ignores PYTHONIOENCODING, hence the option rather than an env var -
+        // see `util::lossy_lines` for why such a line used to be fatal.
+        "--encoding".into(),
+        "utf-8".into(),
         "--progress-template".into(),
         "download:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s".into(),
         "-o".into(),
@@ -410,7 +416,7 @@ fn probe_target_path(
     // anything would hang here forever - the deadline below was unreachable.
     let (line_tx, line_rx) = mpsc::channel::<String>();
     thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        for line in util::lossy_lines(stdout) {
             let t = line.trim().to_string();
             if !t.is_empty() && line_tx.send(t).is_err() {
                 return;
@@ -651,7 +657,7 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     let em_err = ctx.em.clone();
     let err_lines = Arc::clone(&collected);
     let err_handle = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in util::lossy_lines(stderr) {
             let t = line.trim();
             if !t.is_empty() {
                 util::lock(&err_lines).push(t.to_lowercase());
@@ -666,7 +672,7 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     let mut skipped_existing = false;
     let mut produced: Option<PathBuf> = None;
 
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    for line in util::lossy_lines(stdout) {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;

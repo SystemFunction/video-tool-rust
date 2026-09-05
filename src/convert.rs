@@ -1,7 +1,6 @@
 //! FFmpeg command building and the conversion worker (ported from _run_conversion).
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -668,7 +667,7 @@ fn run_conversion_inner(
     // ffmpeg logs to stderr; keep the last lines for error reporting.
     let em_err = ctx.em.clone();
     let err_handle = thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in util::lossy_lines(stderr) {
             let t = line.trim();
             if !t.is_empty() && !t.contains("Press [q]") {
                 em_err.log(Task::Convert, t.to_string());
@@ -680,7 +679,7 @@ fn run_conversion_inner(
     let started = Instant::now();
     let mut last_line = String::new();
 
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    for line in util::lossy_lines(stdout) {
         let line = line.trim().to_string();
         if line.is_empty() {
             continue;

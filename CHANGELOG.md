@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-09-05
+
+### Fixed
+
+- A download died with *"ERROR: Unable to download video: [Errno 22] Invalid
+  argument"* the moment a title carried a character outside the system code
+  page - one accented letter in a SoundCloud track was enough. With no console
+  attached, yt-dlp writes its screen output in that code page, so the line
+  naming the file arrived as bytes that are not valid UTF-8; the log reader
+  took the undecodable line for the end of the stream and stopped, which closed
+  the pipe and killed yt-dlp on its next write. Output from yt-dlp and FFmpeg
+  is now decoded leniently, so a line we cannot read costs at most that line.
+- yt-dlp is asked for UTF-8 output (`--encoding utf-8`), so such titles also
+  appear correctly in the log instead of as mojibake.
+
 ## [0.2.0] - 2026-09-04
 
 ### Added
@@ -179,6 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.1]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.1
+[0.2.0]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.0
 [0.1.5]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.5
 [0.1.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.4
 [0.1.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.3
