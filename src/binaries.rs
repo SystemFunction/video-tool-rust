@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
+use ureq::ResponseExt;
 
 use crate::types::BinaryStatus;
 
@@ -62,7 +63,7 @@ impl Binaries {
 
     // -- path resolution: prefer the local copy, else fall back to PATH --
 
-    fn resolve(&self, name: &str, local: &PathBuf) -> String {
+    fn resolve(&self, name: &str, local: &Path) -> String {
         if local.exists() {
             local.to_string_lossy().to_string()
         } else {
@@ -305,24 +306,25 @@ pub fn download_to_file(
     if !url.to_lowercase().starts_with("https://") {
         return Err(format!("Refusing non-HTTPS download URL: {url}"));
     }
+    // Redirects are followed automatically, so the URL vetted above is not
+    // necessarily the one that serves the bytes. `https_only` makes ureq
+    // refuse a redirect that would downgrade the transport for an executable
+    // we are about to run; the check on the final hop below stays as a second
+    // line of defence in case that setting ever stops being honoured.
     let resp = ureq::get(url)
-        .timeout(Duration::from_secs(180))
+        .config()
+        .https_only(true)
+        .timeout_global(Some(Duration::from_secs(180)))
+        .build()
         .call()
         .map_err(|e| format!("request failed: {e}"))?;
-    // Redirects are followed automatically, so the URL we vetted above is
-    // not necessarily the one that served the bytes. Re-check the final
-    // hop; otherwise a redirect to http:// would silently downgrade the
-    // transport for an executable we are about to run.
-    if !resp.get_url().to_lowercase().starts_with("https://") {
+    if resp.get_uri().scheme_str() != Some("https") {
         return Err(format!(
             "Refusing redirect to a non-HTTPS URL: {}",
-            resp.get_url()
+            resp.get_uri()
         ));
     }
-    let total: u64 = resp
-        .header("Content-Length")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let total: u64 = resp.body().content_length().unwrap_or(0);
     let tmp = {
         let mut p = target.clone();
         let ext = p
@@ -332,7 +334,7 @@ pub fn download_to_file(
         p.set_extension(ext);
         p
     };
-    let mut reader = resp.into_reader();
+    let mut reader = resp.into_body().into_reader();
     let mut written: u64 = 0;
     {
         let mut f = File::create(&tmp).map_err(|e| format!("create tmp: {e}"))?;
@@ -366,7 +368,15 @@ pub fn sha256_file(path: &PathBuf) -> Result<String, String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    // sha2 0.11 hands back a plain byte array rather than a hex-formattable
+    // digest type, so the lowercase hex the SHA2-256SUMS file uses is spelled
+    // out here.
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    Ok(hex)
 }
 
 impl Binaries {
@@ -384,10 +394,14 @@ impl Binaries {
 
         let sums_url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS";
         let sums_text = ureq::get(sums_url)
-            .timeout(Duration::from_secs(30))
+            .config()
+            .https_only(true)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
             .call()
             .map_err(|e| discard(format!("could not fetch SHA2-256SUMS ({e}) - yt-dlp download discarded, please retry")))?
-            .into_string()
+            .body_mut()
+            .read_to_string()
             .map_err(|e| discard(format!("could not read SHA2-256SUMS ({e}) - yt-dlp download discarded, please retry")))?;
 
         let expected = sums_text
@@ -473,10 +487,14 @@ impl Binaries {
     ) -> Result<(), String> {
         let key = self.ffmpeg_platform_key();
         let data: serde_json::Value = ureq::get("https://ffbinaries.com/api/v1/version/latest")
-            .timeout(Duration::from_secs(30))
+            .config()
+            .https_only(true)
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
             .call()
             .map_err(|e| format!("ffbinaries request failed: {e}"))?
-            .into_json()
+            .body_mut()
+            .read_json()
             .map_err(|e| format!("ffbinaries json: {e}"))?;
         let binaries = &data["bin"][key];
         if !binaries.is_object() {

@@ -58,9 +58,9 @@ See the [changelog](CHANGELOG.md) for what changed in each release.
 
 ## Build from source
 
-Requires the Rust toolchain (1.75+). On Windows the executable icon is embedded
-at build time via `build.rs` + `winresource` (using `windres` on the GNU
-toolchain or `rc.exe` on MSVC).
+Requires the Rust toolchain (1.95+, which is what egui 0.36 needs). On Windows
+the executable icon is embedded at build time via `build.rs` + `winresource`
+(using `windres` on the GNU toolchain or `rc.exe` on MSVC).
 
 ```bash
 cargo build --release

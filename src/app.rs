@@ -2579,10 +2579,10 @@ impl App {
                     } else {
                         Color32::from_rgb(30, 110, 50)
                     };
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .fill(bg)
-                        .inner_margin(8.0)
-                        .rounding(6.0)
+                        .inner_margin(8)
+                        .corner_radius(6)
                         .show(ui, |ui| {
                             ui.label(RichText::new(&t.msg).color(Color32::WHITE));
                         });
@@ -2594,29 +2594,31 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.drain();
         self.handle_shortcuts(ctx);
         self.sync_title(ctx);
 
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
             self.ui_header(ui);
             ui.add_space(4.0);
         });
-        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+        egui::Panel::bottom("footer").show(ui, |ui| {
             ui.add_space(2.0);
             self.ui_footer(ui);
             ui.add_space(2.0);
         });
-        egui::SidePanel::left("nav")
+        egui::Panel::left("nav")
             .resizable(false)
-            .exact_width(190.0)
-            .show(ctx, |ui| {
+            .exact_size(190.0)
+            .show(ui, |ui| {
                 ui.add_space(10.0);
                 self.ui_nav(ui);
             });
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| match self.tab {
@@ -2670,20 +2672,24 @@ fn apply_style(ctx: &egui::Context, theme: &str) {
         Color32::from_rgb(10, 60, 70)
     };
     visuals.hyperlink_color = accent();
-    let rounding = egui::Rounding::same(6.0);
-    visuals.widgets.noninteractive.rounding = rounding;
-    visuals.widgets.inactive.rounding = rounding;
-    visuals.widgets.hovered.rounding = rounding;
-    visuals.widgets.active.rounding = rounding;
-    visuals.widgets.open.rounding = rounding;
-    visuals.window_rounding = egui::Rounding::same(8.0);
-    ctx.set_visuals(visuals);
+    let corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.noninteractive.corner_radius = corner_radius;
+    visuals.widgets.inactive.corner_radius = corner_radius;
+    visuals.widgets.hovered.corner_radius = corner_radius;
+    visuals.widgets.active.corner_radius = corner_radius;
+    visuals.widgets.open.corner_radius = corner_radius;
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    // egui keeps a style per theme and picks one from the OS preference. The
+    // app decides its own palette, so both slots get it - otherwise a system
+    // theme switch would swap egui's slot underneath us and undo the choice.
+    ctx.set_visuals_of(egui::Theme::Dark, visuals.clone());
+    ctx.set_visuals_of(egui::Theme::Light, visuals);
 
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.indent = 18.0;
-    ctx.set_style(style);
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 4.0);
+        style.spacing.indent = 18.0;
+    });
 }
 
 fn is_http_url(url: &str) -> bool {
@@ -2792,10 +2798,10 @@ fn chip(ui: &mut egui::Ui, name: &str, ok: bool, value: &str) {
     } else {
         Color32::from_rgb(80, 27, 27)
     };
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(bg)
-        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-        .rounding(8.0)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .corner_radius(8)
         .show(ui, |ui| {
             let short: String = value.chars().take(16).collect();
             ui.label(
@@ -2870,19 +2876,38 @@ fn log_view(ui: &mut egui::Ui, id: &str, lines: &[String], height: f32, dark: bo
     // Rows are uniform monospace, so only the visible slice needs widgets.
     // Emitting all of them meant up to MAX_LOG labels per frame while a job
     // was running and repaints were frequent.
-    let row_height = ui.fonts(|f| f.row_height(&egui::FontId::monospace(LOG_FONT_SIZE)))
-        + ui.spacing().item_spacing.y;
+    //
+    // Two things have to hold for that virtualisation to stay stable, and both
+    // used to be violated - which is what made the log jitter under the mouse,
+    // where hover animations keep asking for fresh frames:
+    //
+    //  * `show_rows` takes the row height *without* item spacing and adds the
+    //    spacing itself, so passing a pre-added value reserved a taller slot
+    //    per row than the rows actually drew into.
+    //  * A wrapped line is two rows tall but still counts as one, so the drawn
+    //    block outgrew its reserved height. `stick_to_bottom` then scrolled to
+    //    that larger height, which changed the visible range, which changed how
+    //    much wrapping happened - a feedback loop that never settled.
+    //
+    // Spacing is therefore zeroed (log lines want to sit tight anyway) and
+    // lines are left unwrapped, terminal style, with a horizontal scrollbar so
+    // nothing becomes unreadable.
+    let row_height = ui
+        .ctx()
+        .fonts_mut(|f| f.row_height(&egui::FontId::monospace(LOG_FONT_SIZE)));
     let fill = if dark {
         Color32::from_rgb(20, 20, 24)
     } else {
         Color32::from_rgb(244, 245, 248)
     };
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(fill)
-        .inner_margin(8.0)
-        .rounding(6.0)
+        .inner_margin(8)
+        .corner_radius(6)
         .show(ui, |ui| {
-            egui::ScrollArea::vertical()
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            egui::ScrollArea::both()
                 .id_salt(id)
                 .max_height(height)
                 .min_scrolled_height(height)

@@ -5,6 +5,41 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-09-19
+
+### Fixed
+
+- **The live log stopped jumping around under the mouse.** Moving the pointer
+  over the log was enough to make its text jitter by a row or more, several
+  times a second. The log only draws the handful of rows that are actually
+  visible, which requires every row to be exactly as tall as the view assumes,
+  and two things broke that assumption: the row height handed to egui already
+  had the item spacing added, which egui then added a second time, so each row
+  reserved more space than it drew into; and a long line wrapped onto a second
+  visual row while still counting as one, which made the drawn block outgrow
+  the height reserved for it. Because the log sticks to the bottom, that larger
+  height scrolled the view further down, which changed which lines were
+  visible, which changed how much wrapping happened - a loop that never
+  settled. It only showed while something asked for continuous repaints, which
+  is exactly what hovering does. Rows are now spaced tightly and left
+  unwrapped, terminal style, with a horizontal scrollbar so no line becomes
+  unreadable. Measured over 140 consecutive frames with nothing changing, the
+  view's scroll position moved 10.2 px before and 0.0 px after.
+
+### Changed
+
+- Every dependency is on its current release: egui/eframe 0.29 → 0.36, ureq
+  2 → 3, zip 2 → 8, dirs 5 → 7, rfd 0.15 → 0.17, sha2 0.10 → 0.11, plus the
+  whole transitive lockfile. Building now needs Rust 1.95 or newer.
+- eframe is pulled in with the glow renderer only. Its 0.36 default switched to
+  wgpu, which drags in a large graphics stack the app has no use for - and one
+  that does not currently build on Windows - while glow is the renderer the app
+  has always used.
+- Downloads of yt-dlp, FFmpeg and the app's own updates are now HTTPS-only at
+  the HTTP-client level (`https_only`), so a redirect that would downgrade the
+  transport fails outright instead of being caught afterwards. The check on the
+  final URL stays as a second line of defence.
+
 ## [0.2.1] - 2026-09-05
 
 ### Fixed
@@ -194,6 +229,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.2
 [0.2.1]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.1
 [0.2.0]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.0
 [0.1.5]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.1.5

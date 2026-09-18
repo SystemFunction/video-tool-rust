@@ -76,9 +76,17 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
 /// user as a hard "update check failed".
 fn is_transient(e: &ureq::Error) -> bool {
     match e {
-        ureq::Error::Status(code, _) => matches!(code, 408 | 429 | 500..=599),
+        ureq::Error::StatusCode(code) => matches!(*code, 408 | 429 | 500..=599),
         // Timeouts, DNS hiccups, dropped connections.
-        ureq::Error::Transport(_) => true,
+        ureq::Error::Timeout(_)
+        | ureq::Error::Io(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed
+        | ureq::Error::BodyStalled
+        | ureq::Error::Protocol(_) => true,
+        // Everything else - a malformed URI, a TLS failure, a body we could
+        // not parse - describes something a second attempt would hit again.
+        _ => false,
     }
 }
 
@@ -88,10 +96,10 @@ fn is_transient(e: &ureq::Error) -> bool {
 /// verbatim behind an already-explanatory prefix.
 fn describe(e: &ureq::Error) -> String {
     match e {
-        ureq::Error::Status(code, _) => {
+        ureq::Error::StatusCode(code) => {
             format!("GitHub returned status {code} - please try again later")
         }
-        ureq::Error::Transport(t) => format!("could not reach GitHub ({t})"),
+        other => format!("could not reach GitHub ({other})"),
     }
 }
 
@@ -103,14 +111,18 @@ fn fetch_latest() -> Result<serde_json::Value, String> {
             std::thread::sleep(RETRY_BACKOFF * attempt);
         }
         match ureq::get(API_LATEST)
-            .set("Accept", "application/vnd.github+json")
-            .set("User-Agent", &format!("video_tool/{VERSION}"))
-            .timeout(Duration::from_secs(20))
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", format!("video_tool/{VERSION}"))
+            .config()
+            .https_only(true)
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
             .call()
         {
-            Ok(resp) => {
+            Ok(mut resp) => {
                 return resp
-                    .into_json()
+                    .body_mut()
+                    .read_json()
                     .map_err(|e| format!("unexpected release data: {e}"))
             }
             Err(e) if is_transient(&e) => last = describe(&e),
@@ -268,10 +280,9 @@ mod tests {
         assert!(!is_newer("v0.1.1".trim_start_matches('v'), "0.1.1"));
     }
 
-    /// Builds a `ureq::Error::Status` the way a failed request would.
+    /// Builds the error a non-2xx response is reported as.
     fn status_err(code: u16) -> ureq::Error {
-        let resp = ureq::Response::new(code, "", "").unwrap();
-        ureq::Error::Status(code, resp)
+        ureq::Error::StatusCode(code)
     }
 
     #[test]

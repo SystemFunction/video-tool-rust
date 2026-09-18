@@ -620,10 +620,8 @@ pub fn output_path_from_line(line: &str) -> Option<String> {
     } else if let Some(p) = after.strip_prefix("Moving file ") {
         // "Moving file \"from\" to \"to\"" - only the destination matters.
         unquote(p.rsplit_once(" to ")?.1)
-    } else if let Some(p) = after.strip_suffix(" has already been downloaded") {
-        unquote(p)
     } else {
-        return None;
+        unquote(after.strip_suffix(" has already been downloaded")?)
     };
     (!candidate.is_empty()).then_some(candidate)
 }
