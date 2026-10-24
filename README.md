@@ -48,7 +48,8 @@ See the [changelog](CHANGELOG.md) for what changed in each release.
   URL it came from and the preset it ran with. Open the file or its folder,
   copy the path or link, or load the URL back into the Download tab.
 - **Setup tab** — install/update yt-dlp (Stable/Nightly/Master channels),
-  install FFmpeg (via ffbinaries) and Deno, with status readout. The versions
+  install FFmpeg (BtbN builds, Windows) and Deno, each verified against its
+  published sha-256, with status readout. The versions
   shown are cached against the binaries on disk so starting the app costs no
   process launches; **Re-check** re-reads them on demand.
 - **Info tab** — feature overview.

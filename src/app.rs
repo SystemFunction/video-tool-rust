@@ -2480,11 +2480,26 @@ impl App {
                             .size(12.0)
                             .color(Color32::GRAY),
                     );
-                    egui::ScrollArea::vertical()
-                        .id_salt("update_notes")
-                        .max_height(180.0)
+                    ui.add_space(2.0);
+                    // Release notes are written on GitHub and can be any
+                    // length, so they get a box of their own rather than
+                    // bleeding into the buttons: a panel that reads as
+                    // scrollable, and a solid scrollbar, which takes real
+                    // width instead of egui's default floating one that is
+                    // painted over the last characters of every line.
+                    egui::Frame::new()
+                        .fill(ui.visuals().extreme_bg_color)
+                        .inner_margin(8)
+                        .corner_radius(6)
                         .show(ui, |ui| {
-                            ui.label(RichText::new(&notes).size(12.0));
+                            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                            egui::ScrollArea::vertical()
+                                .id_salt("update_notes")
+                                .max_height(180.0)
+                                .auto_shrink([false, true])
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(&notes).size(12.0));
+                                });
                         });
                 }
                 if offering && !has_asset {

@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-10-24
+
+### Security
+
+- **FFmpeg and Deno are now verified before they are installed.** FFmpeg used
+  to come from ffbinaries.com, a third-party mirror whose index could point at
+  any download and whose builds are years old; neither it nor Deno was checked
+  at all before being run. FFmpeg now comes from BtbN's static GPL builds on
+  GitHub (newest release branch, not the development snapshot), and both
+  downloads are checked against the sha-256 digest GitHub reports for the
+  asset. A missing or mismatching digest fails the install. On macOS and Linux,
+  where no such zip build exists, the Setup tab now points to the system
+  package manager instead of installing something unverified.
+- **A yt-dlp update no longer overwrites the working copy before it is
+  verified.** The download now lands in a staging file and is only moved into
+  place once its checksum matched, so a failed or tampered download can no
+  longer leave the app without yt-dlp, nor sit unverified where it gets run.
+  Unpacking ffmpeg, ffprobe and Deno from their zips works the same way.
+
+### Fixed
+
+- Large downloads in the Setup tab no longer abort after three minutes. The
+  timeout covered the whole transfer, which a ~200 MB FFmpeg build on a slow
+  line cannot meet; connecting and the server's answer are still bounded
+  tightly, the transfer itself now only by a one-hour ceiling.
+
+### Changed
+
+- Release notes in the update dialog sit in a framed box of their own with a
+  solid scrollbar, so long notes no longer run into the buttons and the
+  scrollbar no longer paints over the end of every line.
+
 ## [0.2.2] - 2026-09-19
 
 ### Fixed
@@ -229,6 +261,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.3
 [0.2.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.2
 [0.2.1]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.1
 [0.2.0]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.0

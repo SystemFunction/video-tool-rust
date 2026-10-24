@@ -17,6 +17,10 @@ use crate::types::BinaryStatus;
 
 const DOWNLOAD_CHUNK: usize = 1 << 17; // 128 KiB
 
+/// Release listing of the FFmpeg builds published by BtbN on GitHub.
+const FFMPEG_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/tags/latest";
+const DENO_API: &str = "https://api.github.com/repos/denoland/deno/releases/latest";
+
 pub struct Binaries {
     pub is_windows: bool,
     pub system: String,  // "Windows" | "Darwin" | "Linux"
@@ -311,10 +315,16 @@ pub fn download_to_file(
     // refuse a redirect that would downgrade the transport for an executable
     // we are about to run; the check on the final hop below stays as a second
     // line of defence in case that setting ever stops being honoured.
+    // No global timeout: it would also cover reading the body, and an FFmpeg
+    // build of ~200 MB does not fit into any budget that still catches a dead
+    // connection quickly. Getting connected and getting an answer are bounded
+    // tightly; the transfer itself only gets a generous ceiling.
     let resp = ureq::get(url)
         .config()
         .https_only(true)
-        .timeout_global(Some(Duration::from_secs(180)))
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .timeout_recv_response(Some(Duration::from_secs(60)))
+        .timeout_recv_body(Some(Duration::from_secs(60 * 60)))
         .build()
         .call()
         .map_err(|e| format!("request failed: {e}"))?;
@@ -377,6 +387,105 @@ pub fn sha256_file(path: &PathBuf) -> Result<String, String> {
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
+}
+
+/// One file of a GitHub release, with the digest GitHub reports for it.
+pub struct ReleaseAsset {
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    /// Lowercase hex sha-256.
+    pub sha256: String,
+}
+
+/// The sha-256 GitHub reports in an asset's `digest` field, if it is usable.
+pub fn asset_sha256(asset: &serde_json::Value) -> Option<String> {
+    let digest = asset["digest"].as_str()?.strip_prefix("sha256:")?.to_lowercase();
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
+}
+
+/// Lists the assets of one release via the GitHub API.
+///
+/// An asset without a usable digest is left out entirely: it could only ever
+/// be installed unverified, which is not on offer.
+fn github_release_assets(api_url: &str) -> Result<Vec<ReleaseAsset>, String> {
+    let body: serde_json::Value = ureq::get(api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", format!("video_tool/{}", crate::consts::VERSION))
+        .config()
+        .https_only(true)
+        .timeout_global(Some(Duration::from_secs(30)))
+        .build()
+        .call()
+        .map_err(|e| format!("GitHub release query failed: {e}"))?
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("unexpected release data: {e}"))?;
+    Ok(body["assets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|a| {
+            Some(ReleaseAsset {
+                name: a["name"].as_str()?.to_string(),
+                url: a["browser_download_url"].as_str()?.to_string(),
+                size: a["size"].as_u64().unwrap_or(0),
+                sha256: asset_sha256(a)?,
+            })
+        })
+        .collect())
+}
+
+/// Downloads `asset` to `target` and checks it against its digest.
+///
+/// Fails closed: on any mismatch the file is deleted again, so nothing that
+/// did not verify is ever left where it could be executed or unpacked.
+fn download_verified(
+    asset: &ReleaseAsset,
+    target: &PathBuf,
+    on_progress: impl FnMut(u64, u64),
+) -> Result<(), String> {
+    let discard = |msg: String| -> String {
+        let _ = fs::remove_file(target);
+        msg
+    };
+    download_to_file(&asset.url, target, on_progress)?;
+    if asset.size > 0 {
+        let got = fs::metadata(target).map(|m| m.len()).unwrap_or(0);
+        if got != asset.size {
+            return Err(discard(format!(
+                "size mismatch for {} - download discarded (expected {} bytes, got {got})",
+                asset.name, asset.size
+            )));
+        }
+    }
+    let actual = sha256_file(target).map_err(discard)?;
+    if actual != asset.sha256 {
+        return Err(discard(format!(
+            "checksum mismatch for {} - download discarded (expected {}..., got {}...)",
+            asset.name,
+            short_hash(&asset.sha256),
+            short_hash(&actual)
+        )));
+    }
+    Ok(())
+}
+
+/// Picks the newest release-branch build for `target` ("win64"/"winarm64").
+///
+/// BtbN names those `ffmpeg-n<ver>-latest-<target>-gpl-<ver>.zip`. The
+/// `master` builds are development snapshots and the `shared` ones need DLLs
+/// next to the exe, so neither is considered. GPL rather than LGPL because the
+/// converter relies on libx264/libx265.
+fn pick_ffmpeg_asset<'a>(assets: &'a [ReleaseAsset], target: &str) -> Option<&'a ReleaseAsset> {
+    assets
+        .iter()
+        .filter_map(|a| {
+            let (ver, rest) = a.name.strip_prefix("ffmpeg-n")?.split_once("-latest-")?;
+            (rest == format!("{target}-gpl-{ver}.zip")).then(|| (crate::util::parse_version(ver), a))
+        })
+        .max_by(|(x, _), (y, _)| x.cmp(y))
+        .map(|(_, a)| a)
 }
 
 impl Binaries {
@@ -444,22 +553,25 @@ impl Binaries {
         (format!("{base}{asset}"), asset.to_string())
     }
 
-    fn ffmpeg_platform_key(&self) -> &'static str {
-        if self.system == "Windows" {
-            "windows-64"
-        } else if self.system == "Darwin" {
-            "osx-64"
-        } else if self.machine.contains("aarch64") || self.machine.contains("arm64") {
-            "linux-arm64"
-        } else {
-            "linux-64"
+    /// BtbN's name for this platform, or `None` where it publishes no zip.
+    fn ffmpeg_build_target(&self) -> Option<&'static str> {
+        if self.system != "Windows" {
+            return None;
         }
+        Some(if self.machine.contains("aarch64") || self.machine.contains("arm64") {
+            "winarm64"
+        } else {
+            "win64"
+        })
     }
 
-    fn deno_url(&self) -> String {
-        let base = "https://github.com/denoland/deno/releases/latest/download/";
-        let asset = if self.system == "Windows" {
-            "deno-x86_64-pc-windows-msvc.zip"
+    fn deno_asset_name(&self) -> &'static str {
+        if self.system == "Windows" {
+            if self.machine.contains("aarch64") || self.machine.contains("arm64") {
+                "deno-aarch64-pc-windows-msvc.zip"
+            } else {
+                "deno-x86_64-pc-windows-msvc.zip"
+            }
         } else if self.system == "Darwin" {
             if self.machine.contains("arm64") || self.machine.contains("aarch64") {
                 "deno-aarch64-apple-darwin.zip"
@@ -470,57 +582,60 @@ impl Binaries {
             "deno-aarch64-unknown-linux-gnu.zip"
         } else {
             "deno-x86_64-unknown-linux-gnu.zip"
-        };
-        format!("{base}{asset}")
+        }
     }
 
+    /// Downloads yt-dlp next to the live copy and only swaps it in once the
+    /// checksum matched, so a failed or tampered download never replaces a
+    /// working binary - and never sits, unverified, where it gets executed.
     pub fn install_ytdlp(&self, on_progress: impl FnMut(u64, u64)) -> Result<(), String> {
         let (url, asset) = self.ytdlp_url();
-        self.download_to_file(&url, &self.ytdlp_local, on_progress)?;
-        self.verify_ytdlp_checksum(&self.ytdlp_local, &asset)?;
-        Ok(())
+        let staged = self.bin_dir.join("yt-dlp.download");
+        let _ = fs::remove_file(&staged);
+        self.download_to_file(&url, &staged, on_progress)?;
+        self.verify_ytdlp_checksum(&staged, &asset)?;
+        fs::rename(&staged, &self.ytdlp_local).map_err(|e| {
+            let _ = fs::remove_file(&staged);
+            format!("could not install yt-dlp: {e}")
+        })
     }
 
+    /// Installs ffmpeg and ffprobe from BtbN's static GPL build.
+    ///
+    /// The zip is checked against the digest GitHub reports before anything
+    /// is unpacked. Outside Windows no zip build exists to verify, so the
+    /// system's package manager is the way to get FFmpeg there.
     pub fn install_ffmpeg(
         &self,
         mut on_progress: impl FnMut(&str, u64, u64),
     ) -> Result<(), String> {
-        let key = self.ffmpeg_platform_key();
-        let data: serde_json::Value = ureq::get("https://ffbinaries.com/api/v1/version/latest")
-            .config()
-            .https_only(true)
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build()
-            .call()
-            .map_err(|e| format!("ffbinaries request failed: {e}"))?
-            .body_mut()
-            .read_json()
-            .map_err(|e| format!("ffbinaries json: {e}"))?;
-        let binaries = &data["bin"][key];
-        if !binaries.is_object() {
-            return Err(format!("No ffmpeg binaries available for {key}."));
-        }
-        for (name, target) in [("ffmpeg", &self.ffmpeg_local), ("ffprobe", &self.ffprobe_local)] {
-            let url = match binaries[name].as_str() {
-                Some(u) => u.to_string(),
-                None => continue,
-            };
-            let zip_path = self.bin_dir.join(format!("{name}.zip"));
-            let nm = name.to_string();
-            let res = self
-                .download_to_file(&url, &zip_path, |w, t| on_progress(&nm, w, t))
-                .and_then(|_| extract_named(&zip_path, target, name));
-            let _ = fs::remove_file(&zip_path);
-            res?;
-        }
-        Ok(())
+        let Some(target) = self.ffmpeg_build_target() else {
+            return Err(
+                "FFmpeg cannot be installed automatically on this platform - please install it \
+                 with your package manager (e.g. `brew install ffmpeg` or `apt install ffmpeg`)."
+                    .into(),
+            );
+        };
+        let assets = github_release_assets(FFMPEG_API)?;
+        let asset = pick_ffmpeg_asset(&assets, target)
+            .ok_or_else(|| format!("no verifiable FFmpeg build found for {target}"))?;
+        let zip_path = self.bin_dir.join("ffmpeg.zip");
+        let res = download_verified(asset, &zip_path, |w, t| on_progress("FFmpeg", w, t))
+            .and_then(|_| extract_named(&zip_path, &self.ffmpeg_local, "ffmpeg"))
+            .and_then(|_| extract_named(&zip_path, &self.ffprobe_local, "ffprobe"));
+        let _ = fs::remove_file(&zip_path);
+        res
     }
 
     pub fn install_deno(&self, on_progress: impl FnMut(u64, u64)) -> Result<(), String> {
-        let url = self.deno_url();
+        let wanted = self.deno_asset_name();
+        let assets = github_release_assets(DENO_API)?;
+        let asset = assets
+            .iter()
+            .find(|a| a.name == wanted)
+            .ok_or_else(|| format!("no verifiable Deno download found ({wanted})"))?;
         let zip_path = self.bin_dir.join("deno.zip");
-        let res = self
-            .download_to_file(&url, &zip_path, on_progress)
+        let res = download_verified(asset, &zip_path, on_progress)
             .and_then(|_| extract_named(&zip_path, &self.deno_local, "deno"));
         let _ = fs::remove_file(&zip_path);
         res
@@ -555,7 +670,9 @@ fn short_hash(hash: &str) -> String {
 /// Extracts the member named `name`(.exe) from a zip into `target`.
 ///
 /// Only the member's base name is ever considered and the destination is a
-/// fixed path, so a crafted archive cannot steer the write elsewhere.
+/// fixed path, so a crafted archive cannot steer the write elsewhere. The
+/// member is unpacked beside the target and renamed over it at the end, so an
+/// interrupted extraction leaves the previous binary intact.
 fn extract_named(zip_path: &PathBuf, target: &PathBuf, name: &str) -> Result<(), String> {
     let file = File::open(zip_path).map_err(|e| e.to_string())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
@@ -574,8 +691,14 @@ fn extract_named(zip_path: &PathBuf, target: &PathBuf, name: &str) -> Result<(),
             .unwrap_or("")
             .to_string();
         if wanted.contains(&base) {
-            let mut out = File::create(target).map_err(|e| e.to_string())?;
-            std::io::copy(&mut member, &mut out).map_err(|e| e.to_string())?;
+            let tmp = target.with_extension("extract");
+            let res = File::create(&tmp)
+                .and_then(|mut out| std::io::copy(&mut member, &mut out).map(|_| ()))
+                .and_then(|_| fs::rename(&tmp, target));
+            if let Err(e) = res {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!("could not unpack {name}: {e}"));
+            }
             return Ok(());
         }
     }
@@ -599,3 +722,88 @@ pub fn no_window(cmd: &mut Command) {
 
 #[cfg(not(windows))]
 pub fn no_window(_cmd: &mut Command) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn asset(name: &str) -> ReleaseAsset {
+        ReleaseAsset {
+            name: name.into(),
+            url: format!("https://example.com/{name}"),
+            size: 1,
+            sha256: "0".repeat(64),
+        }
+    }
+
+    #[test]
+    fn the_newest_static_gpl_release_build_is_picked() {
+        let assets: Vec<ReleaseAsset> = [
+            "ffmpeg-master-latest-win64-gpl.zip",
+            "ffmpeg-n8.1-latest-win64-gpl-8.1.zip",
+            "ffmpeg-n10.0-latest-win64-gpl-shared-10.0.zip",
+            "ffmpeg-n10.0-latest-win64-lgpl-10.0.zip",
+            "ffmpeg-n9.0-latest-win64-gpl-9.0.zip",
+            "ffmpeg-n9.0-latest-winarm64-gpl-9.0.zip",
+            "checksums.sha256",
+        ]
+        .into_iter()
+        .map(asset)
+        .collect();
+        // 9.0 beats 8.1 numerically; shared, lgpl and master never qualify.
+        let win = pick_ffmpeg_asset(&assets, "win64").unwrap();
+        assert_eq!(win.name, "ffmpeg-n9.0-latest-win64-gpl-9.0.zip");
+        let arm = pick_ffmpeg_asset(&assets, "winarm64").unwrap();
+        assert_eq!(arm.name, "ffmpeg-n9.0-latest-winarm64-gpl-9.0.zip");
+        assert!(pick_ffmpeg_asset(&assets, "linux64").is_none());
+    }
+
+    #[test]
+    fn only_a_well_formed_sha256_digest_is_accepted() {
+        let ok = serde_json::json!({ "digest": format!("sha256:{}", "AB".repeat(32)) });
+        assert_eq!(asset_sha256(&ok), Some("ab".repeat(32)));
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "digest": null }),
+            serde_json::json!({ "digest": format!("sha512:{}", "ab".repeat(32)) }),
+            serde_json::json!({ "digest": "sha256:abc" }),
+            serde_json::json!({ "digest": format!("sha256:{}", "zz".repeat(32)) }),
+        ] {
+            assert_eq!(asset_sha256(&bad), None, "{bad}");
+        }
+    }
+
+    /// Hits the network: `cargo test -- --ignored live_`.
+    #[test]
+    #[ignore]
+    fn live_release_assets_resolve_and_verify() {
+        let ffmpeg = github_release_assets(FFMPEG_API).unwrap();
+        let pick = pick_ffmpeg_asset(&ffmpeg, "win64").expect("an FFmpeg build");
+        eprintln!("ffmpeg: {} ({} bytes)", pick.name, pick.size);
+        let deno = github_release_assets(DENO_API).unwrap();
+        let asset = deno
+            .iter()
+            .find(|a| a.name == "deno-x86_64-pc-windows-msvc.zip")
+            .expect("a Deno build");
+        let dir = std::env::temp_dir().join(format!("vt_live_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let zip = dir.join("deno.zip");
+        download_verified(asset, &zip, |_, _| {}).unwrap();
+        let exe = dir.join("deno.exe");
+        extract_named(&zip, &exe, "deno").unwrap();
+        assert!(fs::metadata(&exe).unwrap().len() > 1_000_000);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_download_that_does_not_match_its_digest_is_deleted() {
+        let dir = std::env::temp_dir().join(format!("vt_verify_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("file.zip");
+        // A non-HTTPS URL is refused before anything is written.
+        let a = ReleaseAsset { url: "http://example.com/x".into(), ..asset("x") };
+        assert!(download_verified(&a, &target, |_, _| {}).is_err());
+        assert!(!target.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::binaries::{download_to_file, sha256_file};
+use crate::binaries::{asset_sha256, download_to_file, sha256_file};
 use crate::consts::VERSION;
 use crate::util;
 
@@ -155,10 +155,7 @@ pub fn check_latest() -> Result<Option<Release>, String> {
             // Without a usable digest we deliberately produce no asset, which
             // downgrades the offer to "open the release page" rather than
             // installing something unverified.
-            let digest = a["digest"].as_str()?.strip_prefix("sha256:")?.to_lowercase();
-            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
+            let digest = asset_sha256(a)?;
             Some(Asset {
                 url: a["browser_download_url"].as_str()?.to_string(),
                 size: a["size"].as_u64().unwrap_or(0),
