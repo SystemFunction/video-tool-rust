@@ -5,6 +5,22 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-11-15
+
+### Fixed
+
+- **4K and 1440p downloads no longer come out as 1080p.** The format selector
+  for the resolution presets demanded H.264 (`avc1`) in its first choice, but
+  YouTube serves H.264 only up to 1080p - anything higher exists as VP9 or AV1
+  alone. That first choice therefore always matched the 1080p H.264 stream and
+  won before the higher-resolution formats were ever considered. The height is
+  now the only hard filter, and H.264 is preferred through the sort order after
+  the resolution: at 1080p and below the file is still H.264 as before, while
+  4K and 1440p arrive in their real resolution, as VP9 or AV1 in an MP4.
+  "Best Quality (H.264)" keeps its H.264 guarantee and with it the 1080p
+  ceiling on YouTube; "Best Quality (AV1 preferred)" or the 4K preset are the
+  ones that go higher.
+
 ## [0.2.3] - 2026-10-24
 
 ### Security
@@ -261,6 +277,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.4
 [0.2.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.3
 [0.2.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.2
 [0.2.1]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.1

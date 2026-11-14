@@ -180,8 +180,13 @@ pub fn build_download_cmd(
                     ],
                 );
             } else {
+                // The height is the only hard filter; the codec preference
+                // lives in -S, after the resolution. YouTube serves H.264 up
+                // to 1080p only, so an avc1 filter in front made every 1440p
+                // and 4K request settle for 1080p - while at a height H.264
+                // does exist, it still wins over VP9/AV1.
                 let f = format!(
-                    "bv*[vcodec^=avc1][height<={q}]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][height<={q}]+ba/bv*[height<={q}]+ba/bv*+ba/b",
+                    "bv*[height<={q}]+ba/b[height<={q}]/bv*+ba/b",
                     q = quality
                 );
                 let s = format!("res:{q},vcodec:h264,acodec:m4a", q = quality);
@@ -961,6 +966,18 @@ mod tests {
         for q in ["audio", "audio_opus", "1080"] {
             let line = cmd_line(q, &opts, false, Retry::default());
             assert!(line.contains("--embed-thumbnail"), "{q}: {line}");
+        }
+    }
+
+    #[test]
+    fn a_resolution_preset_does_not_insist_on_h264() {
+        // H.264 tops out at 1080p on YouTube; requiring it capped 4K there.
+        for q in ["2160", "1440", "1080"] {
+            let line = cmd_line(q, &DownloadOpts::default(), false, Retry::default());
+            assert!(!line.contains("[vcodec^=avc1]"), "{q}: {line}");
+            assert!(line.contains(&format!("bv*[height<={q}]+ba")), "{q}: {line}");
+            // H.264 stays preferred, but only after the resolution.
+            assert!(line.contains(&format!("-S res:{q},vcodec:h264")), "{q}: {line}");
         }
     }
 
