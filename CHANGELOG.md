@@ -5,6 +5,32 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.5] - 2026-11-15
+
+### Added
+
+- **Download a whole channel.** A new "Whole channel" switch next to the URL
+  field turns the field into a channel input: `@name`, a bare name, a `UC...`
+  channel id or any channel URL all work, and a channel URL without a tab gets
+  `/videos`, the list of uploads. Every upload is then fetched in the best
+  quality there is (`bv*+ba/b`, muxed into MKV so VP9/AV1 and Opus need no
+  re-encode) into `<channel>/<upload date> - <title> [<id>].mkv` inside the
+  chosen folder. The ids of finished videos go into `downloaded.txt` in that
+  folder - yt-dlp's own archive format, so an archive from a hand-run
+  `--download-archive downloaded.txt` is picked up as well - and starting the
+  same channel again only fetches what is new. Retries are raised to 20 with
+  a 5 s pause, partial files are resumed, and the status line shows which
+  video of how many is running. Cookies, SponsorBlock, subtitles, embedding
+  and the speed limit apply as usual; the quality preset is set aside while
+  the switch is on.
+- When some videos of a channel cannot be downloaded (members-only, private,
+  an upcoming premiere), the log says so and that a rerun only retries those.
+
+### Fixed
+
+- A playlist run that met one already existing file was reported as "nothing
+  downloaded", even when it had fetched every other entry.
+
 ## [0.2.4] - 2026-11-15
 
 ### Fixed
@@ -277,6 +303,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.5]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.5
 [0.2.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.4
 [0.2.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.3
 [0.2.2]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.2

@@ -38,7 +38,13 @@ const TAB_INFO: usize = 4;
 struct QueueItem {
     url: String,
     state: QueueState,
+    /// Queued as a whole channel; fixed at queueing time so toggling the
+    /// switch later does not change what an entry already waiting will do.
+    channel: bool,
 }
+
+/// Stands in for the quality preset of a whole-channel run.
+const CHANNEL_PRESET: &str = "channel";
 
 /// Config key holding the last binary probe, see `probe_cache_load`.
 const PROBE_CACHE_KEY: &str = "binary_probe_cache";
@@ -86,6 +92,9 @@ pub struct App {
     dl_potoken_url: String,
     dl_playlist: bool,
     dl_playlist_items: String,
+    /// "Whole channel" switch: the URL field takes a channel, and the run
+    /// fetches every upload in the best quality (see `DownloadOpts::channel`).
+    dl_channel_mode: bool,
     dl_rate_limit: String,
     dl_advanced: bool,
     /// URLs lined up for download, oldest first.
@@ -212,6 +221,7 @@ impl App {
             dl_potoken_url: config.get_str("potoken_url", ""),
             dl_playlist: config.get_bool("playlist", false),
             dl_playlist_items: config.get_str("playlist_items", ""),
+            dl_channel_mode: config.get_bool("channel_mode", false),
             dl_rate_limit: config.get_str("rate_limit", ""),
             dl_advanced: false,
             dl_queue: Vec::new(),
@@ -546,6 +556,17 @@ impl App {
             self.toast_key("toast.need_url", true);
             return false;
         }
+        let url = if self.dl_channel_mode {
+            match util::channel_url(&url) {
+                Some(u) => u,
+                None => {
+                    self.toast_key("toast.bad_channel", true);
+                    return false;
+                }
+            }
+        } else {
+            url
+        };
         if !is_http_url(&url) {
             self.toast_key("toast.bad_url", true);
             return false;
@@ -555,7 +576,7 @@ impl App {
         if self
             .dl_queue
             .iter()
-            .any(|i| i.url == url && i.state == QueueState::Pending)
+            .any(|i| i.url == url && i.channel == self.dl_channel_mode && i.state == QueueState::Pending)
         {
             self.toast_key("dl.queue_dupe", true);
             return false;
@@ -563,6 +584,7 @@ impl App {
         self.dl_queue.push(QueueItem {
             url,
             state: QueueState::Pending,
+            channel: self.dl_channel_mode,
         });
         self.dl_url.clear();
         true
@@ -615,7 +637,8 @@ impl App {
         self.dl_queue[index].state = QueueState::Running;
         self.dl_current = Some(index);
         let url = self.dl_queue[index].url.clone();
-        self.spawn_download(url);
+        let channel = self.dl_queue[index].channel;
+        self.spawn_download(url, channel);
     }
 
     /// Files the finished run away and lets the queue move on.
@@ -637,7 +660,11 @@ impl App {
         }
         if let Outcome::Success(path) = &outcome {
             let url = self.dl_current_url.clone();
-            let detail = label_of(self.lang, &self.dl_current_quality, QUALITY_OPTIONS);
+            let detail = if self.dl_current_quality == CHANNEL_PRESET {
+                self.t("dl.channel_detail").to_string()
+            } else {
+                label_of(self.lang, &self.dl_current_quality, QUALITY_OPTIONS)
+            };
             self.remember(history::Kind::Download, path.as_deref(), &url, &detail);
         }
         if matches!(outcome, Outcome::Cancelled) {
@@ -647,7 +674,7 @@ impl App {
         self.advance_queue();
     }
 
-    fn spawn_download(&mut self, url: String) {
+    fn spawn_download(&mut self, url: String, channel: bool) {
         if self.dl_busy {
             return;
         }
@@ -689,8 +716,15 @@ impl App {
             playlist: self.dl_playlist,
             playlist_items: clean_playlist_items(&self.dl_playlist_items),
             rate_limit: self.dl_rate_limit.trim().to_string(),
+            channel,
         };
-        let quality = self.dl_quality.clone();
+        // The worker ignores the preset for a channel run; the marker only
+        // labels the history entry.
+        let quality = if channel {
+            CHANNEL_PRESET.to_string()
+        } else {
+            self.dl_quality.clone()
+        };
         self.dl_current_url = url.clone();
         self.dl_current_quality = quality.clone();
         self.dl_last_outcome = Outcome::Failed;
@@ -1225,7 +1259,11 @@ impl App {
             ui.label(RichText::new(self.t("dl.source_quality")).strong());
             ui.horizontal(|ui| {
                 ui.label(self.t("dl.url"));
-                let hint = self.t("dl.url_hint");
+                let hint = if self.dl_channel_mode {
+                    self.t("dl.channel_url_hint")
+                } else {
+                    self.t("dl.url_hint")
+                };
                 ui.add(
                     egui::TextEdit::singleline(&mut self.dl_url)
                         .desired_width(f32::INFINITY)
@@ -1252,6 +1290,15 @@ impl App {
                     let msg = self.tf("dl.queue_added", &[&waiting.to_string()]);
                     self.toast(&msg, false);
                 }
+                ui.add_space(8.0);
+                let l_channel = self.t("dl.channel");
+                if ui
+                    .checkbox(&mut self.dl_channel_mode, l_channel)
+                    .on_hover_text(self.t("dl.channel_hint"))
+                    .changed()
+                {
+                    self.config.set_bool("channel_mode", self.dl_channel_mode);
+                }
             });
             ui.add_space(4.0);
             egui::Grid::new("dl_opts")
@@ -1259,7 +1306,11 @@ impl App {
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label(self.t("dl.quality"));
-                    if combo(ui, lang, "dl_quality", &mut self.dl_quality, QUALITY_OPTIONS) {
+                    if self.dl_channel_mode {
+                        // The channel profile picks its own format; showing the
+                        // preset as usable would only suggest otherwise.
+                        ui.label(RichText::new(self.t("dl.channel_quality")).color(Color32::GRAY));
+                    } else if combo(ui, lang, "dl_quality", &mut self.dl_quality, QUALITY_OPTIONS) {
                         self.config.set_str("last_quality", &self.dl_quality);
                     }
                     ui.end_row();

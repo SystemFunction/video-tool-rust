@@ -33,6 +33,11 @@ const FIRST_ATTEMPT: Retry = Retry {
 /// another one.
 const RETRY_PAUSE: Duration = Duration::from_secs(3);
 
+/// File in the output folder that records every video a channel run fetched.
+/// yt-dlp's own format ("youtube <id>" per line), so one archive serves any
+/// number of channels and an archive from a hand-run yt-dlp is picked up too.
+pub const CHANNEL_ARCHIVE: &str = "downloaded.txt";
+
 type ChildSlot = Arc<Mutex<Option<Child>>>;
 
 pub struct DlCtx {
@@ -111,6 +116,9 @@ pub fn build_download_cmd(
     attempt: Attempt,
 ) -> Vec<String> {
     let Attempt { outtmpl, force_overwrite, retry } = attempt;
+    // A channel run brings its own format choice; reading the preset as a
+    // video one keeps the audio-only special cases below out of its way.
+    let quality = if opts.channel { "best" } else { quality };
     let mut cmd: Vec<String> = vec![bin.ytdlp_path()];
     let push = |c: &mut Vec<String>, items: &[&str]| {
         for it in items {
@@ -119,6 +127,13 @@ pub fn build_download_cmd(
     };
 
     match quality {
+        // A channel run takes whatever is best, codec regardless - which on
+        // YouTube means VP9/AV1 with Opus. MKV holds those as they are, where
+        // MP4 would need the audio re-encoded, so the streams are only muxed.
+        _ if opts.channel => push(
+            &mut cmd,
+            &["-f", "bv*+ba/b", "--merge-output-format", "mkv"],
+        ),
         "audio_wav" => push(
             &mut cmd,
             &[
@@ -205,7 +220,12 @@ pub fn build_download_cmd(
         // Escaping only doubles '%', so joining the pattern on afterwards is
         // still a plain path join.
         let mut tmpl = PathBuf::from(util::escape_outtmpl(&Path::new(out_dir).to_string_lossy()));
-        if opts.playlist {
+        if opts.channel {
+            // Sorted by date inside one folder per channel; the id keeps two
+            // uploads with the same title apart.
+            tmpl.push("%(channel,uploader|Channel)s");
+            tmpl.push("%(upload_date)s - %(title).150B [%(id)s].%(ext)s");
+        } else if opts.playlist {
             // A playlist drops dozens of files into the folder, so it gets one
             // of its own. The comma chain picks the first field the extractor
             // actually filled; the default keeps the path from collapsing when
@@ -217,13 +237,15 @@ pub fn build_download_cmd(
         }
         tmpl.to_string_lossy().to_string()
     };
+    // A channel run goes on for hours, so it rides out longer hiccups.
+    let retries = if opts.channel { "20" } else { "10" };
     let mut base: Vec<String> = vec![
         "--newline".into(),
-        if opts.playlist { "--yes-playlist".into() } else { "--no-playlist".into() },
+        if opts.playlist || opts.channel { "--yes-playlist".into() } else { "--no-playlist".into() },
         "--retries".into(),
-        "10".into(),
+        retries.into(),
         "--fragment-retries".into(),
-        "10".into(),
+        retries.into(),
         "--concurrent-fragments".into(),
         if retry.low_concurrency { "1".into() } else { "8".into() },
         "--extractor-retries".into(),
@@ -245,7 +267,15 @@ pub fn build_download_cmd(
         "-o".into(),
         outtmpl.map(|s| s.to_string()).unwrap_or(default_tmpl),
     ];
-    if opts.playlist && !opts.playlist_items.trim().is_empty() {
+    if opts.channel {
+        // The archive is what makes a rerun cheap: everything listed in it is
+        // skipped before a single format is requested.
+        base.push("--download-archive".into());
+        base.push(Path::new(out_dir).join(CHANNEL_ARCHIVE).to_string_lossy().to_string());
+        base.push("--retry-sleep".into());
+        base.push("5".into());
+        base.push("--continue".into());
+    } else if opts.playlist && !opts.playlist_items.trim().is_empty() {
         base.push("--playlist-items".into());
         base.push(opts.playlist_items.trim().to_string());
     }
@@ -474,7 +504,7 @@ fn probe_target_path(
 fn log_preflight_hints(ctx: &DlCtx, url: &str, quality: &str, cookies: &Option<String>, opts: &DownloadOpts) {
     let lo = url.to_lowercase();
     let has_cookies = cookies.is_some() || !opts.cookiefile.is_empty();
-    let is_audio = matches!(quality, "audio" | "audio_wav" | "audio_opus");
+    let is_audio = !opts.channel && matches!(quality, "audio" | "audio_wav" | "audio_opus");
     if (lo.contains("youtube.com") || lo.contains("youtu.be")) && !is_audio {
         if ctx.js_runtime.is_empty() {
             ctx.em.log(Task::Download, ctx.t("dlw.warn_nojs"));
@@ -671,6 +701,9 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
 
     let pct_re = Regex::new(r"(\d+(?:\.\d+)?)").unwrap();
     let generic_re = Regex::new(r"(\d+(?:\.\d+)?)%").unwrap();
+    // "[download] Downloading item 5 of 300" - where a list run stands.
+    let item_re = Regex::new(r"^\[download\] Downloading item (\d+) of (\d+)").unwrap();
+    let mut item: Option<String> = None;
     let mut last_progress = String::new();
     let mut skipped_existing = false;
     let mut produced: Option<PathBuf> = None;
@@ -688,6 +721,14 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
         if is_progress {
             last_progress = line.clone();
         }
+        if let Some(m) = item_re.captures(&line) {
+            item = Some(format!("{}/{}", &m[1], &m[2]));
+        }
+        // The per-file status, led by the list position when there is one.
+        let with_item = |s: String| match &item {
+            Some(i) => format!("[{i}] {s}"),
+            None => s,
+        };
         if line.to_lowercase().contains("has already been downloaded") {
             skipped_existing = true;
         }
@@ -706,7 +747,7 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
                         ctx.em.progress(Task::Download, (p / 100.0).clamp(0.0, 1.0));
                         ctx.em.status(
                             Task::Download,
-                            ctx.tf("dlw.progress_status", &[&m[1], parts[1], parts[2]]),
+                            with_item(ctx.tf("dlw.progress_status", &[&m[1], parts[1], parts[2]])),
                         );
                     }
                 }
@@ -714,8 +755,10 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
         } else if let Some(m) = generic_re.captures(&line) {
             if let Ok(p) = m[1].parse::<f32>() {
                 ctx.em.progress(Task::Download, (p / 100.0).clamp(0.0, 1.0));
-                ctx.em
-                    .status(Task::Download, ctx.tf("dlw.downloading_pct", &[&m[1]]));
+                ctx.em.status(
+                    Task::Download,
+                    with_item(ctx.tf("dlw.downloading_pct", &[&m[1]])),
+                );
             }
         }
     }
@@ -788,11 +831,21 @@ fn run_download_inner(
     // A freshly drawn "video-1234" is already known to be free, so the whole
     // conflict dance - including a second yt-dlp run just to learn the target
     // name - is skipped and the download starts right away.
-    let anon = anon_outtmpl(url, out_dir);
+    // A channel run names its files itself, archive and all.
+    let anon = if opts.channel { None } else { anon_outtmpl(url, out_dir) };
     let (outtmpl, force_overwrite, cancelled) = match &anon {
         Some((tmpl, stem)) => {
             ctx.em.log(Task::Download, ctx.tf("dlw.anon_name", &[stem]));
             (Some(tmpl.clone()), false, false)
+        }
+        // The archive decides what is new, so nothing is ever overwritten.
+        None if opts.channel => {
+            let archive = Path::new(out_dir).join(CHANNEL_ARCHIVE);
+            ctx.em.log(
+                Task::Download,
+                ctx.tf("dlw.channel_mode", &[&archive.to_string_lossy()]),
+            );
+            (None, false, false)
         }
         // A playlist writes many files, so probing for "the" target name would
         // only ever describe its first entry. yt-dlp's own per-file handling
@@ -885,7 +938,9 @@ fn run_download_inner(
         ctx.em.status(Task::Download, ctx.t("status.cancelled"));
         ctx.em.log(Task::Download, ctx.t("dlw.cancelled_log"));
         ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Cancelled));
-    } else if code == 0 && skipped_existing {
+    } else if code == 0 && skipped_existing && !(opts.playlist || opts.channel) {
+        // Only for a single video does "already there" mean nothing happened;
+        // a list that met one existing file may well have fetched the rest.
         ctx.em.progress(Task::Download, -1.0);
         ctx.em.status(Task::Download, ctx.t("dlw.nothing_status"));
         ctx.em.log(Task::Download, ctx.t("dlw.nothing_log"));
@@ -905,6 +960,11 @@ fn run_download_inner(
             Task::Download,
             ctx.tf("dlw.failed_log", &[&code.to_string()]),
         );
+        if opts.channel {
+            // yt-dlp moves on past a video it cannot get (members-only,
+            // private, an upcoming premiere) and only reports it at the end.
+            ctx.em.log(Task::Download, ctx.t("dlw.channel_partial"));
+        }
         if joined.contains("empty media response") {
             ctx.em.log(
                 Task::Download,
@@ -967,6 +1027,76 @@ mod tests {
             let line = cmd_line(q, &opts, false, Retry::default());
             assert!(line.contains("--embed-thumbnail"), "{q}: {line}");
         }
+    }
+
+    #[test]
+    fn a_channel_run_takes_the_best_streams_into_mkv_with_an_archive() {
+        let opts = DownloadOpts { channel: true, embed: true, ..Default::default() };
+        // Even an audio preset left selected must not leak into a channel run.
+        let cmd = build_download_cmd(
+            &Binaries::new(),
+            "https://www.youtube.com/@x/videos",
+            "out 50%",
+            "audio_wav",
+            &None,
+            &opts,
+            Attempt::default(),
+        );
+        let line = cmd.join(" ");
+        assert!(line.contains("-f bv*+ba/b --merge-output-format mkv"), "{line}");
+        assert!(!line.contains("-x "), "{line}");
+        assert!(!line.contains("Merger:"), "{line}");
+        assert!(line.contains("--embed-thumbnail"), "{line}");
+        assert!(line.contains("--yes-playlist"), "{line}");
+        assert!(line.contains("--retries 20") && line.contains("--retry-sleep 5"), "{line}");
+        let archive = cmd.iter().position(|a| a == "--download-archive").unwrap();
+        assert!(cmd[archive + 1].ends_with(CHANNEL_ARCHIVE), "{line}");
+        // The folder is a literal path in the archive, a template in -o.
+        assert!(cmd[archive + 1].starts_with("out 50%") && !cmd[archive + 1].contains("%%"));
+        let o = cmd.iter().position(|a| a == "-o").unwrap();
+        assert!(cmd[o + 1].starts_with("out 50%%"), "{}", cmd[o + 1]);
+        assert!(cmd[o + 1].contains("%(channel,uploader|Channel)s"), "{}", cmd[o + 1]);
+        assert!(cmd[o + 1].ends_with("%(upload_date)s - %(title).150B [%(id)s].%(ext)s"));
+        assert_eq!(cmd.last().unwrap(), "https://www.youtube.com/@x/videos");
+    }
+
+    /// Hits the network: `cargo test -- --ignored live_`. Uses the oldest
+    /// channel on YouTube - one 19-second upload.
+    #[test]
+    #[ignore]
+    fn live_channel_run_fetches_once_and_then_skips() {
+        let bin = Binaries::new();
+        let dir = std::env::temp_dir().join(format!("vt_channel_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.to_string_lossy().to_string();
+        let url = util::channel_url("@jawed").unwrap();
+        let opts = DownloadOpts { channel: true, ..Default::default() };
+        let run = || {
+            let cmd = build_download_cmd(&bin, &url, &out, "1080", &None, &opts, Attempt::default());
+            let o = spawn(&bin, &cmd).output().unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        run();
+        let archive = std::fs::read_to_string(dir.join(CHANNEL_ARCHIVE)).unwrap();
+        assert!(archive.contains("youtube jNQXAC9IVRw"), "{archive}");
+        let channel_dir = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().is_dir())
+            .expect("a channel folder")
+            .path();
+        let files: Vec<String> = std::fs::read_dir(&channel_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        eprintln!("{} -> {files:?}", channel_dir.display());
+        assert!(files.iter().any(|f| f.starts_with("20050424 - ") && f.ends_with("[jNQXAC9IVRw].mkv")));
+        // The second run finds it in the archive and downloads nothing.
+        let second = run();
+        assert!(second.contains("already been recorded in the archive"), "{second}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -920,6 +920,40 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Mode playlist : chaque entrée est enregistrée dans son propre dossier.",
         ),
 
+        // ---------------- 0.2.5: whole channel ----------------
+        "dl.channel" => ("Whole channel", "Ganzer Kanal", "Chaîne entière"),
+        "dl.channel_hint" => (
+            "Enter a channel (@name or its URL) and every upload is downloaded in the best quality,              one folder per channel. Already downloaded videos are remembered in downloaded.txt,              so starting again only fetches new ones.",
+            "Kanal eingeben (@Name oder Kanal-URL) - alle Videos werden in bester Qualität geladen,              ein Ordner pro Kanal. Bereits geladene Videos merkt sich downloaded.txt,              ein erneuter Start lädt also nur neue.",
+            "Saisissez une chaîne (@nom ou son URL) : toutes les vidéos sont téléchargées en meilleure              qualité, un dossier par chaîne. Les vidéos déjà téléchargées sont notées dans              downloaded.txt, un nouveau lancement ne récupère donc que les nouvelles.",
+        ),
+        "dl.channel_url_hint" => (
+            "@channelname or channel URL",
+            "@Kanalname oder Kanal-URL",
+            "@nomdelachaîne ou URL de la chaîne",
+        ),
+        "dl.channel_quality" => (
+            "Best available (MKV) - set by channel mode",
+            "Beste verfügbare (MKV) - durch Kanal-Modus festgelegt",
+            "Meilleure disponible (MKV) - fixée par le mode chaîne",
+        ),
+        "dl.channel_detail" => ("Whole channel (best, MKV)", "Ganzer Kanal (beste, MKV)", "Chaîne entière (meilleure, MKV)"),
+        "toast.bad_channel" => (
+            "Please enter a channel: @name, name or channel URL.",
+            "Bitte einen Kanal eingeben: @Name, Name oder Kanal-URL.",
+            "Veuillez saisir une chaîne : @nom, nom ou URL de la chaîne.",
+        ),
+        "dlw.channel_mode" => (
+            "Channel mode: every upload in the best quality, one folder per channel. Archive: {}",
+            "Kanal-Modus: alle Videos in bester Qualität, ein Ordner pro Kanal. Archiv: {}",
+            "Mode chaîne : toutes les vidéos en meilleure qualité, un dossier par chaîne. Archive : {}",
+        ),
+        "dlw.channel_partial" => (
+            "Some videos of the channel could not be downloaded (e.g. members-only, private or an upcoming premiere) - see the log above. Everything else is saved; starting again only tries what is still missing.",
+            "Einige Videos des Kanals konnten nicht geladen werden (z. B. nur für Mitglieder, privat oder eine kommende Premiere) - siehe Log oben. Alles andere ist gespeichert; ein erneuter Start versucht nur, was noch fehlt.",
+            "Certaines vidéos de la chaîne n'ont pas pu être téléchargées (p. ex. réservées aux membres, privées ou une première à venir) - voir le journal ci-dessus. Tout le reste est enregistré ; un nouveau lancement ne tente que ce qui manque encore.",
+        ),
+
         // ---------------- 0.2.0: convert trim and media info ----------------
         "cv.trim" => ("Trim", "Zuschneiden", "Découper"),
         "cv.trim_start" => ("From", "Von", "De"),

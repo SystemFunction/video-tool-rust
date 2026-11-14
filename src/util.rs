@@ -285,6 +285,74 @@ pub fn outtmpl_for(path: &Path) -> String {
     format!("{}.%(ext)s", escape_outtmpl(&without_ext.to_string_lossy()))
 }
 
+/// Channel tabs that already name a listing of their own.
+const CHANNEL_TABS: &[&str] = &["videos", "shorts", "streams"];
+
+/// Turns what the user typed for "whole channel" into the URL of its video list.
+///
+/// Accepts "@handle", a bare handle, a "UC..." channel id or any YouTube
+/// channel URL; a channel URL without a tab gets "/videos", which is the
+/// list of uploads rather than the channel's home page with its shelves.
+/// Other http(s) URLs pass through untouched - yt-dlp knows channels on
+/// plenty of sites. `None` means nothing usable was typed. Whatever comes
+/// back starts with "https://" or "http://", so it can never reach yt-dlp
+/// looking like an option.
+pub fn channel_url(input: &str) -> Option<String> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let lower = text.to_lowercase();
+    let schemeless_yt = ["youtube.com/", "www.youtube.com/", "m.youtube.com/"]
+        .iter()
+        .any(|p| lower.starts_with(p));
+    let url = if lower.starts_with("https://") || lower.starts_with("http://") {
+        text.to_string()
+    } else if schemeless_yt {
+        format!("https://{text}")
+    } else {
+        // A handle, with or without its "@", or a channel id.
+        let bare = text.strip_prefix('@').unwrap_or(text);
+        let bad = |c: char| c.is_whitespace() || "/\\?#&%\"'<>".contains(c);
+        if bare.is_empty() || bare.contains(bad) {
+            return None;
+        }
+        let is_id = !text.starts_with('@')
+            && bare.len() == 24
+            && bare.starts_with("UC")
+            && bare.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        return Some(if is_id {
+            format!("https://www.youtube.com/channel/{bare}/videos")
+        } else {
+            format!("https://www.youtube.com/@{bare}/videos")
+        });
+    };
+
+    let after_scheme = &url[url.find("://")? + 3..];
+    let (host, rest) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
+    let host = host.to_lowercase();
+    let host = host.trim_start_matches("www.").trim_start_matches("m.");
+    if host != "youtube.com" {
+        return Some(url);
+    }
+    let path = rest.split(['?', '#']).next().unwrap_or("");
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    let (base, tab) = match segs.as_slice() {
+        [handle, tail @ ..] if handle.starts_with('@') => (handle.to_string(), tail.first()),
+        [kind, name, tail @ ..] if matches!(*kind, "channel" | "c" | "user") => {
+            (format!("{kind}/{name}"), tail.first())
+        }
+        // A video, a playlist or a search: not a channel, but yt-dlp can
+        // still walk it, so it is handed over as typed.
+        _ => return Some(url),
+    };
+    let tab = tab
+        .map(|t| t.to_lowercase())
+        .filter(|t| CHANNEL_TABS.contains(&t.as_str()))
+        .unwrap_or_else(|| "videos".to_string());
+    Some(format!("https://www.youtube.com/{base}/{tab}"))
+}
+
 const MEDIA_EXTS: &[&str] = &[
     "mp4", "mkv", "webm", "mov", "m4v", "avi", "flv", "ts", "mp3", "m4a", "wav",
     "opus", "flac", "aac", "ogg", "oga",
@@ -347,6 +415,59 @@ pub fn convert_audio_ext(codec_key: &str) -> Option<&'static str> {
         "audio_mp3" => Some("mp3"),
         "audio_wav" => Some("wav"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod channel_tests {
+    use super::channel_url;
+
+    #[test]
+    fn a_handle_in_any_spelling_becomes_its_video_list() {
+        for typed in ["@Placeholder", "Placeholder", "  @Placeholder  "] {
+            assert_eq!(
+                channel_url(typed).as_deref(),
+                Some("https://www.youtube.com/@Placeholder/videos"),
+                "{typed}"
+            );
+        }
+        assert_eq!(
+            channel_url("UCabcdefghijklmnopqrstuv").as_deref(),
+            Some("https://www.youtube.com/channel/UCabcdefghijklmnopqrstuv/videos")
+        );
+    }
+
+    #[test]
+    fn a_channel_url_gets_the_videos_tab_unless_it_names_one() {
+        let cases = [
+            ("https://www.youtube.com/@Placeholder", "https://www.youtube.com/@Placeholder/videos"),
+            ("https://youtube.com/@Placeholder/featured", "https://www.youtube.com/@Placeholder/videos"),
+            ("youtube.com/@Placeholder?si=x", "https://www.youtube.com/@Placeholder/videos"),
+            ("https://m.youtube.com/@Placeholder/shorts", "https://www.youtube.com/@Placeholder/shorts"),
+            ("https://www.youtube.com/@Placeholder/videos", "https://www.youtube.com/@Placeholder/videos"),
+            ("https://www.youtube.com/channel/UCx/streams", "https://www.youtube.com/channel/UCx/streams"),
+            ("https://www.youtube.com/c/Name", "https://www.youtube.com/c/Name/videos"),
+        ];
+        for (typed, want) in cases {
+            assert_eq!(channel_url(typed).as_deref(), Some(want), "{typed}");
+        }
+    }
+
+    #[test]
+    fn other_urls_pass_through_and_junk_is_refused() {
+        let pl = "https://www.youtube.com/playlist?list=PL123";
+        assert_eq!(channel_url(pl).as_deref(), Some(pl));
+        let tt = "https://www.tiktok.com/@someone";
+        assert_eq!(channel_url(tt).as_deref(), Some(tt));
+        for junk in ["", "   ", "@", "two words", "--exec calc", "a/b", "x?y"] {
+            // "--exec" alone is a valid-looking handle, but it can only ever
+            // come back as part of a URL, never as an argument of its own.
+            match channel_url(junk) {
+                None => {}
+                Some(u) => assert!(u.starts_with("https://"), "{junk}: {u}"),
+            }
+        }
+        assert!(channel_url("two words").is_none());
     }
 }
 

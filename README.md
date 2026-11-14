@@ -29,7 +29,9 @@ See the [changelog](CHANGELOG.md) for what changed in each release.
 - **Themes** — dark or light, from the button in the header or the Setup tab.
 - **Download tab** — quality presets (best / AV1 / 4K…480p / audio MP3·WAV·Opus),
   a **queue** that works any number of links off one after another, whole
-  **playlists** (optionally only a range) into a folder of their own, cookies
+  **playlists** (optionally only a range) into a folder of their own, a
+  **whole-channel** mode (type `@name`, get every upload in the best quality,
+  one folder per channel, with an archive so reruns only fetch new videos), cookies
   (browser or `cookies.txt`), existing-file handling (ask / auto-rename /
   overwrite / skip) with an up-front filename probe, a folder picker for the save
   location, and advanced options: impersonate (anti-bot), SponsorBlock,

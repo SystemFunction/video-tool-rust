@@ -116,6 +116,10 @@ pub struct DownloadOpts {
     pub playlist_items: String,
     /// Optional `--limit-rate` value ("2M"), empty for unlimited.
     pub rate_limit: String,
+    /// Whole-channel run: every upload in the best quality there is, one
+    /// folder per channel, with an archive so a rerun only fetches what is new.
+    /// Implies `playlist` and overrides the quality preset.
+    pub channel: bool,
 }
 
 /// A request from the download worker asking the UI to resolve a file collision.
