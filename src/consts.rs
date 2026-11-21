@@ -3,11 +3,14 @@
 //! Dropdown tables are `(value, i18n-key)` pairs - the second element is
 //! resolved through `crate::i18n` at draw time, never shown verbatim.
 
-pub const VERSION: &str = "0.2.5";
+pub const VERSION: &str = "0.2.6";
 pub const APP_NAME: &str = "Video Tool";
 
 /// First stable yt-dlp release with the reworked Instagram extractor.
 pub const YTDLP_INSTAGRAM_FIX: &str = "2026.07.04";
+
+/// First yt-dlp release that refuses unsafe file extensions (CVE-2024-38519).
+pub const YTDLP_MIN_SAFE: &str = "2024.07.01";
 
 /// Hosts that block yt-dlp's default TLS fingerprint - impersonation is
 /// auto-enabled for these when curl_cffi support is available.

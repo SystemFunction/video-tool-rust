@@ -389,6 +389,31 @@ pub fn parse_version(text: &str) -> Vec<u64> {
     }
 }
 
+/// `path` made absolute against the GUI's own working directory.
+///
+/// Child processes run in the app folder (see `Binaries::prepare`), so a
+/// relative path the user typed has to be resolved here, before it is handed
+/// to one of them. Anything unresolvable is passed on unchanged.
+pub fn absolute(path: &str) -> String {
+    std::path::absolute(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Extensions the app may hand to the shell: what it downloads or converts.
+const OPENABLE_EXTS: &[&str] = &["mxf", "mpg", "mpeg", "wmv", "3gp"];
+
+/// True for an existing local media file - the only kind of path the app
+/// passes to the desktop's "open" action. An executable, script or shortcut
+/// is never launched from History, whatever path ended up stored there.
+pub fn is_openable_media(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    (MEDIA_EXTS.contains(&ext.as_str()) || OPENABLE_EXTS.contains(&ext.as_str())) && path.is_file()
+}
+
 /// True when `installed` is a parseable yt-dlp CalVer older than `required`.
 pub fn ytdlp_older_than(installed: &str, required: &str) -> bool {
     let inst = parse_version(installed);
@@ -415,6 +440,35 @@ pub fn convert_audio_ext(codec_key: &str) -> Option<&'static str> {
         "audio_mp3" => Some("mp3"),
         "audio_wav" => Some("wav"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod open_tests {
+    use super::*;
+
+    #[test]
+    fn only_existing_media_files_may_be_handed_to_the_shell() {
+        let dir = std::env::temp_dir().join(format!("vt_open_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["clip.MP4", "song.mp3", "evil.exe", "x.bat", "y.lnk", "noext"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert!(is_openable_media(&dir.join("clip.MP4")));
+        assert!(is_openable_media(&dir.join("song.mp3")));
+        for name in ["evil.exe", "x.bat", "y.lnk", "noext", "missing.mp4"] {
+            assert!(!is_openable_media(&dir.join(name)), "{name}");
+        }
+        // A folder with a media-looking name is not a file.
+        std::fs::create_dir_all(dir.join("folder.mp4")).unwrap();
+        assert!(!is_openable_media(&dir.join("folder.mp4")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn relative_paths_are_resolved_before_children_see_them() {
+        assert!(Path::new(&absolute("out")).is_absolute());
+        assert_eq!(absolute(""), "");
     }
 }
 

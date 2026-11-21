@@ -920,6 +920,13 @@ fn entry(key: &'static str) -> (&'static str, &'static str, &'static str) {
             "Mode playlist : chaque entrée est enregistrée dans son propre dossier.",
         ),
 
+        // ---------------- 0.2.6: hardening ----------------
+        "dlw.ytdlp_unsafe" => (
+            "yt-dlp {} is too old to download safely: releases before {} let a website choose any file extension, including .exe. Please update yt-dlp in the Setup tab.",
+            "yt-dlp {} ist zu alt für sichere Downloads: Versionen vor {} lassen eine Webseite jede Dateiendung wählen, auch .exe. Bitte yt-dlp im Setup-Tab aktualisieren.",
+            "yt-dlp {} est trop ancien pour télécharger en sécurité : les versions antérieures à {} laissent un site choisir n'importe quelle extension, y compris .exe. Veuillez mettre à jour yt-dlp dans l'onglet Configuration.",
+        ),
+
         // ---------------- 0.2.5: whole channel ----------------
         "dl.channel" => ("Whole channel", "Ganzer Kanal", "Chaîne entière"),
         "dl.channel_hint" => (

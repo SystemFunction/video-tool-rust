@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use regex::Regex;
 
-use crate::binaries::{no_window, Binaries};
-use crate::consts::{ANON_NAME_HOSTS, IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX};
+use crate::binaries::Binaries;
+use crate::consts::{ANON_NAME_HOSTS, IMPERSONATE_AUTO_HOSTS, YTDLP_INSTAGRAM_FIX, YTDLP_MIN_SAFE};
 use crate::emit::Emitter;
 use crate::i18n::{t, tf, Lang};
 use crate::types::{ConflictDecision, ConflictReq, DownloadOpts, Outcome, Task, UiMsg};
@@ -315,6 +315,14 @@ pub fn build_download_cmd(
     base.push("--extractor-args".into());
     base.push(format!("youtube:player_client={player_clients}"));
 
+    // Name the exact ffmpeg rather than leaving yt-dlp to look one up: its own
+    // search is not the app's, and the verified copy in bin/ is the one meant.
+    let ffmpeg = bin.ffmpeg_path();
+    if Path::new(&ffmpeg).is_file() {
+        base.push("--ffmpeg-location".into());
+        base.push(ffmpeg);
+    }
+
     if !opts.plugins_dir.is_empty() {
         base.push("--plugin-dirs".into());
         base.push("default".into());
@@ -413,10 +421,7 @@ fn anon_outtmpl(url: &str, out_dir: &str) -> Option<(String, String)> {
 fn spawn(bin: &Binaries, args: &[String]) -> Command {
     let mut cmd = Command::new(&args[0]);
     cmd.args(&args[1..]);
-    bin.apply_env(&mut cmd);
-    no_window(&mut cmd);
-    // No console is attached, so yt-dlp must never wait on stdin.
-    cmd.stdin(Stdio::null());
+    bin.prepare(&mut cmd);
     cmd
 }
 
@@ -595,7 +600,11 @@ fn resolve_conflict(
                     Task::Download,
                     ctx.tf("dlw.overwriting", &[&file_name(&target)]),
                 );
-                return (None, true, false);
+                // The consent covers this one file. Left to the default
+                // template, the real run would derive the name again from
+                // fresh remote metadata, and --force-overwrites would then
+                // apply to whichever existing file that name happens to hit.
+                return (Some(util::outtmpl_for(&target)), true, false);
             }
             Ok(ConflictDecision::Rename(p)) => {
                 ctx.em
@@ -639,26 +648,28 @@ struct RunOutcome {
     produced: Option<PathBuf>,
 }
 
-/// Pulls the file yt-dlp says it wrote out of one of its own log lines.
+/// Distinguishes the per-run report files of overlapping or repeated runs.
+static REPORT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// Where one yt-dlp run reports the file it finally wrote.
 ///
-/// yt-dlp announces every destination it opens, so the *last* line of a run
-/// that names one is the file the user ends up with: the per-stream downloads
-/// come first, the merge or the audio extraction that replaces them last.
-pub fn output_path_from_line(line: &str) -> Option<String> {
-    let rest = line.trim().strip_prefix('[')?;
-    let (_tag, after) = rest.split_once("] ")?;
-    let unquote = |s: &str| s.trim().trim_matches('"').trim().to_string();
-    let candidate = if let Some(p) = after.strip_prefix("Destination: ") {
-        unquote(p)
-    } else if let Some(p) = after.strip_prefix("Merging formats into ") {
-        unquote(p)
-    } else if let Some(p) = after.strip_prefix("Moving file ") {
-        // "Moving file \"from\" to \"to\"" - only the destination matters.
-        unquote(p.rsplit_once(" to ")?.1)
-    } else {
-        unquote(after.strip_suffix(" has already been downloaded")?)
-    };
-    (!candidate.is_empty()).then_some(candidate)
+/// The path comes from yt-dlp's `--print-to-file after_move:...`, a statement
+/// about the file it actually moved into place. It used to be scraped from the
+/// human-readable log instead, which also carries remote text: a playlist
+/// title with an embedded line feed could forge a "Destination:" line that the
+/// History tab would later probe and hand to the shell.
+fn report_file(bin: &Binaries) -> PathBuf {
+    let n = REPORT_SEQ.fetch_add(1, Ordering::Relaxed);
+    bin.app_dir.join(format!("produced-{}-{n}.txt", std::process::id()))
+}
+
+/// The last file named in a run's report, if it wrote one.
+fn read_report(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok()?;
+    text.lines()
+        .map(str::trim)
+        .rfind(|l| !l.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Runs yt-dlp once, feeding progress and log lines to the UI.
@@ -666,7 +677,17 @@ pub fn output_path_from_line(line: &str) -> Option<String> {
 /// `None` means the process could not be started at all - status and log
 /// already say so.
 fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
-    let mut command = spawn(&ctx.bin, cmd);
+    // The report option goes in front of the URL, which stays the last word.
+    let report = report_file(&ctx.bin);
+    let _ = std::fs::remove_file(&report);
+    let mut cmd = cmd.to_vec();
+    let url = cmd.pop()?;
+    cmd.push("--print-to-file".into());
+    cmd.push("after_move:%(filepath)s".into());
+    // The file name is read as an output template, so '%' must be escaped.
+    cmd.push(util::escape_outtmpl(&report.to_string_lossy()));
+    cmd.push(url);
+    let mut command = spawn(&ctx.bin, &cmd);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = match command.spawn() {
         Ok(c) => c,
@@ -706,7 +727,6 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     let mut item: Option<String> = None;
     let mut last_progress = String::new();
     let mut skipped_existing = false;
-    let mut produced: Option<PathBuf> = None;
 
     for line in util::lossy_lines(stdout) {
         let line = line.trim().to_string();
@@ -732,12 +752,6 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
         if line.to_lowercase().contains("has already been downloaded") {
             skipped_existing = true;
         }
-        if !is_progress {
-            if let Some(p) = output_path_from_line(&line) {
-                produced = Some(PathBuf::from(p));
-            }
-        }
-
         if is_progress {
             let rest = &line["download:".len()..];
             let parts: Vec<&str> = rest.split('|').map(|p| p.trim()).collect();
@@ -773,6 +787,8 @@ fn run_ytdlp(ctx: &DlCtx, cmd: &[String]) -> Option<RunOutcome> {
     };
 
     let logs = util::lock(&collected).join("\n");
+    let produced = read_report(&report);
+    let _ = std::fs::remove_file(&report);
     Some(RunOutcome {
         code,
         skipped_existing,
@@ -826,6 +842,20 @@ fn run_download_inner(
     cookies: &Option<String>,
     opts: &DownloadOpts,
 ) {
+    // Older releases let a remote title pick any extension for the file they
+    // write - .exe and .dll included (CVE-2024-38519). The default output
+    // folder is the one the portable exe is usually started from, so such a
+    // build is refused outright rather than merely warned about.
+    if util::ytdlp_older_than(&ctx.ytdlp_version, YTDLP_MIN_SAFE) {
+        ctx.em.log(
+            Task::Download,
+            ctx.tf("dlw.ytdlp_unsafe", &[&ctx.ytdlp_version, YTDLP_MIN_SAFE]),
+        );
+        ctx.em.status(Task::Download, ctx.t("dlw.failed"));
+        ctx.em.toast(ctx.t("dlw.failed"), true);
+        ctx.em.send(UiMsg::Finished(Task::Download, Outcome::Failed));
+        return;
+    }
     log_preflight_hints(ctx, url, quality, cookies, opts);
 
     // A freshly drawn "video-1234" is already known to be free, so the whole
@@ -1166,27 +1196,85 @@ mod tests {
         assert_eq!(failure_kind("error: sign in to confirm your age"), None);
     }
 
+    /// Hits the network: `cargo test -- --ignored live_launch_dir`. Moves the
+    /// test process into a folder holding a hostile yt-dlp.conf - the
+    /// situation of the portable exe started from Downloads - so run it alone.
     #[test]
-    fn the_file_yt_dlp_wrote_is_read_off_its_own_log_lines() {
-        assert_eq!(
-            output_path_from_line("[download] Destination: C:/v/clip.f137.mp4"),
-            Some("C:/v/clip.f137.mp4".to_string())
+    #[ignore]
+    fn live_launch_dir_config_is_ignored_and_the_written_file_is_reported() {
+        let bin = Arc::new(Binaries::new());
+        let root = std::env::temp_dir().join(format!("vt_launch_{}", std::process::id()));
+        let (launch, out) = (root.join("launch"), root.join("out"));
+        std::fs::create_dir_all(&launch).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        let marker = root.join("marker.txt");
+        std::fs::write(
+            launch.join("yt-dlp.conf"),
+            format!("--exec \"cmd /c type nul > {}\"\n", marker.display()),
+        )
+        .unwrap();
+        std::env::set_current_dir(&launch).unwrap();
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = DlCtx {
+            bin: Arc::clone(&bin),
+            em: Emitter::new(tx, eframe::egui::Context::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            child: Arc::new(Mutex::new(None)),
+            js_runtime: String::new(),
+            ytdlp_version: String::new(),
+            lang: Lang::En,
+        };
+        let cmd = build_download_cmd(
+            &bin,
+            "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            &out.to_string_lossy(),
+            "480",
+            &None,
+            &DownloadOpts::default(),
+            Attempt::default(),
         );
-        assert_eq!(
-            output_path_from_line("[Merger] Merging formats into \"C:/v/clip.mp4\""),
-            Some("C:/v/clip.mp4".to_string())
+        let run = run_ytdlp(&ctx, &cmd).expect("yt-dlp started");
+        assert_eq!(run.code, 0, "{}", run.logs);
+        assert!(!marker.exists(), "the launch-dir yt-dlp.conf was loaded");
+        let produced = run.produced.expect("the report names the written file");
+        eprintln!("produced: {}", produced.display());
+        assert!(produced.starts_with(&out) && produced.is_file(), "{}", produced.display());
+        assert!(util::is_openable_media(&produced));
+        std::env::set_current_dir(std::env::temp_dir()).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_produced_file_is_the_last_line_of_the_report() {
+        let dir = std::env::temp_dir().join(format!("vt_report_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = dir.join("r.txt");
+        assert_eq!(read_report(&report), None, "no report means no file");
+        // A playlist appends one line per entry, CRLF-terminated on Windows;
+        // a title containing " to " no longer confuses anything.
+        std::fs::write(&report, "C:/v/a.mp4\r\nC:/v/b to c.mp4\r\n\r\n").unwrap();
+        assert_eq!(read_report(&report), Some(PathBuf::from("C:/v/b to c.mp4")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmed_overwrite_is_pinned_to_the_probed_file() {
+        let target = PathBuf::from("out 50%/Clip A.mp4");
+        let tmpl = util::outtmpl_for(&target);
+        let cmd = build_download_cmd(
+            &Binaries::new(),
+            "https://www.youtube.com/watch?v=abc",
+            "out 50%",
+            "1080",
+            &None,
+            &DownloadOpts::default(),
+            Attempt { outtmpl: Some(&tmpl), force_overwrite: true, retry: Retry::default() },
         );
-        assert_eq!(
-            output_path_from_line("[MoveFiles] Moving file \"tmp/a.mp4\" to \"out/a.mp4\""),
-            Some("out/a.mp4".to_string())
-        );
-        assert_eq!(
-            output_path_from_line("[download] out/a.mp4 has already been downloaded"),
-            Some("out/a.mp4".to_string())
-        );
-        // Progress and ordinary chatter name no file.
-        assert_eq!(output_path_from_line("[youtube] Extracting URL: https://x"), None);
-        assert_eq!(output_path_from_line("download:  12.0%|1.2MiB/s|00:10"), None);
+        let o = cmd.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(cmd[o + 1], tmpl);
+        assert!(!cmd[o + 1].contains("%(title)"), "{}", cmd[o + 1]);
+        assert!(cmd.iter().any(|a| a == "--force-overwrites"));
     }
 
     #[test]

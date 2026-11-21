@@ -65,14 +65,22 @@ impl Binaries {
         }
     }
 
-    // -- path resolution: prefer the local copy, else fall back to PATH --
+    // -- path resolution: prefer the local copy, else an absolute PATH hit --
 
+    /// Never hands the OS a bare program name. On Windows an unqualified name
+    /// is also looked up in the directory of the running exe - typically the
+    /// Downloads folder the portable build is started from - so anything a
+    /// browser saved there as yt-dlp.exe or ffmpeg.exe would win over the
+    /// real tool. When neither copy exists the local path is returned anyway:
+    /// spawning it fails cleanly as "not found".
     fn resolve(&self, name: &str, local: &Path) -> String {
         if local.exists() {
-            local.to_string_lossy().to_string()
-        } else {
-            name.to_string()
+            return local.to_string_lossy().to_string();
         }
+        find_on_path(name, self.is_windows)
+            .unwrap_or_else(|| local.to_path_buf())
+            .to_string_lossy()
+            .to_string()
     }
 
     pub fn ytdlp_path(&self) -> String {
@@ -84,30 +92,35 @@ impl Binaries {
     pub fn ffprobe_path(&self) -> String {
         self.resolve("ffprobe", &self.ffprobe_local)
     }
-    /// A Command with the console window hidden (Windows) and bin_dir on PATH.
+    /// A Command set up like every other child the app starts (see `prepare`).
     pub fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
-        self.apply_env(&mut cmd);
-        no_window(&mut cmd);
-        // A GUI app has no console to read from; leaving stdin inherited lets
-        // a child block forever waiting on input that can never arrive.
-        cmd.stdin(Stdio::null());
+        self.prepare(&mut cmd);
         cmd
     }
 
-    /// Prepends bin_dir to PATH so a bundled Deno is found by yt-dlp.
+    /// The environment every child process gets.
+    ///
+    /// The working directory is pinned to the app's own folder. Inherited, it
+    /// would be wherever the GUI was launched from - usually Downloads - and
+    /// yt-dlp reads a yt-dlp.conf from there (which may carry --exec) and its
+    /// own lookups of ffmpeg/deno may search it. A GUI app has no console to
+    /// read from either; leaving stdin inherited lets a child block forever.
+    pub fn prepare(&self, cmd: &mut Command) {
+        self.apply_env(cmd);
+        cmd.current_dir(&self.app_dir);
+        no_window(cmd);
+        cmd.stdin(Stdio::null());
+    }
+
+    /// Puts bin_dir first on the child's PATH so yt-dlp finds the verified
+    /// ffmpeg/Deno copies before any other. An existing later entry for it is
+    /// dropped rather than left to lose against what precedes it.
     pub fn apply_env(&self, cmd: &mut Command) {
-        let bin = self.bin_dir.to_string_lossy().to_string();
-        let cur = std::env::var("PATH").unwrap_or_default();
-        let sep = if self.is_windows { ';' } else { ':' };
-        let already = cur.split(sep).any(|p| p == bin);
-        if !already {
-            let new = if cur.is_empty() {
-                bin
-            } else {
-                format!("{bin}{sep}{cur}")
-            };
-            cmd.env("PATH", new);
+        let cur = std::env::var_os("PATH").unwrap_or_default();
+        let rest = std::env::split_paths(&cur).filter(|p| *p != self.bin_dir);
+        if let Ok(path) = std::env::join_paths(std::iter::once(self.bin_dir.clone()).chain(rest)) {
+            cmd.env("PATH", path);
         }
     }
 
@@ -153,7 +166,9 @@ impl Binaries {
             candidates.push(("deno".into(), self.deno_local.to_string_lossy().into()));
         }
         for rt in ["deno", "node"] {
-            candidates.push((rt.into(), rt.into()));
+            if let Some(path) = find_on_path(rt, self.is_windows) {
+                candidates.push((rt.into(), path.to_string_lossy().into()));
+            }
         }
         for (name, exe) in candidates {
             if let Some((true, out)) = self.run_capture(&exe, &["--version"]) {
@@ -283,6 +298,30 @@ impl Binaries {
     fn sha256_file(path: &PathBuf) -> Result<String, String> {
         sha256_file(path)
     }
+}
+
+/// The first absolute PATH entry holding `name` (with `.exe` on Windows).
+///
+/// Relative entries are skipped: they would resolve against whatever the
+/// current directory happens to be, which is exactly the lookup this avoids.
+pub fn find_on_path(name: &str, is_windows: bool) -> Option<PathBuf> {
+    let file = if is_windows { format!("{name}.exe") } else { name.to_string() };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Absolute path of the OS file opener, so it cannot be shadowed by a
+/// same-named file in the exe's directory (see `Binaries::resolve`).
+#[cfg(windows)]
+pub fn system_opener() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .or_else(|| std::env::var_os("windir"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("explorer.exe")
 }
 
 /// "size:mtime" for a file, or "-" when it does not exist.
@@ -734,6 +773,41 @@ mod tests {
             size: 1,
             sha256: "0".repeat(64),
         }
+    }
+
+    #[test]
+    fn every_child_runs_in_the_app_folder_with_bin_first_on_path() {
+        let bin = Binaries::new();
+        let mut cmd = Command::new("anything");
+        bin.prepare(&mut cmd);
+        // Not the launch folder, which is usually Downloads.
+        assert_eq!(cmd.get_current_dir(), Some(bin.app_dir.as_path()));
+        let path = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v)
+            .expect("PATH is set for the child");
+        let entries: Vec<PathBuf> = std::env::split_paths(path).collect();
+        assert_eq!(entries.first(), Some(&bin.bin_dir));
+        assert_eq!(entries.iter().filter(|p| **p == bin.bin_dir).count(), 1, "no duplicate entry");
+    }
+
+    #[test]
+    fn a_missing_tool_never_resolves_to_a_bare_name() {
+        let bin = Binaries::new();
+        for path in [bin.ytdlp_path(), bin.ffmpeg_path(), bin.ffprobe_path()] {
+            // A bare name would let Windows search the exe's own folder.
+            assert!(Path::new(&path).is_absolute(), "{path}");
+        }
+        assert_eq!(find_on_path("surely-no-such-tool-vt", cfg!(windows)), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_opener_is_the_system_explorer() {
+        let opener = system_opener();
+        assert!(opener.is_absolute(), "{}", opener.display());
+        assert!(opener.ends_with("explorer.exe"));
     }
 
     #[test]

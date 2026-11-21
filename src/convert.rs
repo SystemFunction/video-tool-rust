@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::binaries::{no_window, Binaries};
+use crate::binaries::Binaries;
 use crate::emit::Emitter;
 use crate::i18n::{t, tf, Lang};
 use crate::types::{MediaInfo, Outcome, Task, UiMsg};
@@ -643,9 +643,10 @@ fn run_conversion_inner(
 
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
-    no_window(&mut command);
+    // Same environment as every other child - in particular a pinned working
+    // directory and bin/ first on PATH, which this spawn used to skip.
+    ctx.bin.prepare(&mut command);
     command
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = match command.spawn() {

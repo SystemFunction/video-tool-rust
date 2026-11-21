@@ -5,6 +5,46 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.6] - 2026-11-21
+
+### Security
+
+- **A `yt-dlp.conf` in the launch folder can no longer run commands.** yt-dlp
+  reads a "home" configuration file from its current directory, and a config
+  file may contain `--exec`. Every child process inherited the GUI's working
+  directory - for the portable exe usually the Downloads folder, where any
+  website can drop a file. Reproduced with the installed yt-dlp: a
+  `yt-dlp.conf` holding `--exec` next to the launch point was executed on the
+  next download. All child processes (yt-dlp, ffmpeg, ffprobe, Deno) now run
+  in `~/.video_tool_v3` instead.
+- **No more bare program names.** When a managed copy in `bin/` was missing,
+  the app started `yt-dlp`, `ffmpeg`, `ffprobe`, `deno` or `node` by name -
+  and Windows then also looks in the folder of the running exe, so an
+  `ffmpeg.exe` saved into Downloads would have run. Tools are now found on
+  PATH by the app itself and started by absolute path. `explorer` is started
+  as `%SystemRoot%\explorer.exe`. yt-dlp is given `--ffmpeg-location` for the
+  verified ffmpeg, `bin/` always comes first on its PATH, and the conversion
+  worker now uses the same process setup as everything else.
+- **yt-dlp releases before 2024.07.01 are refused.** They let a website pick
+  any extension for the file they write, `.exe` and `.dll` included
+  (CVE-2024-38519) - into the folder the exe is usually started from.
+- **The downloaded file's path comes from yt-dlp itself.** It used to be
+  scraped from the human-readable log, which also carries remote text: a
+  playlist title with an embedded line feed could forge a "Destination:"
+  line that the History tab would later open. yt-dlp now reports the file
+  it moved into place via `--print-to-file`. "Open" in History only launches
+  existing media files - never an `.exe`, script or shortcut - and "Open
+  folder" only opens folders.
+- **"Overwrite" in the ask dialog now overwrites only the file it named.**
+  The download re-read the title from the site and applied
+  `--force-overwrites` to whatever name came out, so a changed title could
+  replace a different existing file. The confirmed path is now pinned.
+
+### Fixed
+
+- A destination whose title contained " to " was recorded with a truncated
+  path in History.
+
 ## [0.2.5] - 2026-11-15
 
 ### Added
@@ -303,6 +343,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Setup tab that installs and updates yt-dlp (stable/nightly/master), FFmpeg and
   Deno into `~/.video_tool_v3/`, shared with the Python version of the app.
 
+[0.2.6]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.6
 [0.2.5]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.5
 [0.2.4]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.4
 [0.2.3]: https://github.com/SystemFunction/video-tool-rust/releases/tag/v0.2.3

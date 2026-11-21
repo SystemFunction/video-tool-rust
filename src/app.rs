@@ -678,9 +678,10 @@ impl App {
         if self.dl_busy {
             return;
         }
-        let out_dir = self.dl_output.trim().to_string();
+        // Absolute, because yt-dlp runs in the app folder, not in ours.
+        let out_dir = util::absolute(self.dl_output.trim());
         let cookiefile = if self.dl_cookies == "cookiefile" {
-            self.dl_cookiefile.trim().to_string()
+            util::absolute(self.dl_cookiefile.trim())
         } else {
             String::new()
         };
@@ -759,6 +760,9 @@ impl App {
         if inp.is_empty() || out.is_empty() {
             return self.toast_key("toast.need_io", true);
         }
+        // Absolute, because ffmpeg runs in the app folder, not in ours.
+        let inp = util::absolute(&inp);
+        out = util::absolute(&out);
         if !Path::new(&inp).exists() {
             return self.toast_key("toast.no_input", true);
         }
@@ -877,7 +881,7 @@ impl App {
         let bin = self.bin.clone();
         let em = self.emitter();
         thread::spawn(move || {
-            let info = convert::probe_media_info(&bin, &file);
+            let info = convert::probe_media_info(&bin, &util::absolute(&file));
             em.send(UiMsg::MediaInfo(Box::new(info)));
         });
     }
@@ -3074,7 +3078,7 @@ fn open_url(url: &str) {
     #[cfg(windows)]
     {
         // `explorer <url>` avoids cmd.exe's argument parsing entirely.
-        let _ = std::process::Command::new("explorer").arg(url).spawn();
+        let _ = std::process::Command::new(crate::binaries::system_opener()).arg(url).spawn();
     }
     #[cfg(target_os = "macos")]
     {
@@ -3091,13 +3095,13 @@ fn open_url(url: &str) {
 /// Only a path that exists is passed on, and it goes to the opener as a
 /// single argument, so nothing in the name can turn into a second one.
 fn open_path(path: &str) {
-    if path.is_empty() || !Path::new(path).is_file() {
+    if path.is_empty() || !util::is_openable_media(Path::new(path)) {
         return;
     }
     let p = PathBuf::from(path);
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(p).spawn();
+        let _ = std::process::Command::new(crate::binaries::system_opener()).arg(p).spawn();
     }
     #[cfg(target_os = "macos")]
     {
@@ -3110,13 +3114,14 @@ fn open_path(path: &str) {
 }
 
 fn open_folder(path: &str) {
-    if path.is_empty() || !Path::new(path).exists() {
+    // A file here would be opened through its handler rather than shown.
+    if path.is_empty() || !Path::new(path).is_dir() {
         return;
     }
     let p = PathBuf::from(path);
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("explorer").arg(p).spawn();
+        let _ = std::process::Command::new(crate::binaries::system_opener()).arg(p).spawn();
     }
     #[cfg(target_os = "macos")]
     {
